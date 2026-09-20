@@ -39,6 +39,7 @@ module Node : sig
     ; state : Coq.State.t  (** (Full) State of node *)
     ; diags : Coq.Pp_t.t Lang.Diagnostic.t list
           (** Diagnostics associated to the node *)
+    ; anomaly : bool (** Exception category, not inferred from diagnostic text. *)
     ; messages : Message.t list
     ; info : Info.t
     }
@@ -158,7 +159,8 @@ end
     stop after the point specified there has been reached. Output functions are
     in the [io] record, used to send partial updates. *)
 val check :
-     io:Io.CallBack.t
+     ?stop_before:(Coq.Ast.t -> bool)
+  -> io:Io.CallBack.t
   -> token:Coq.Limits.Token.t
   -> target:Target.t
   -> doc:t

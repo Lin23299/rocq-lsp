@@ -8,16 +8,16 @@ module Lsp = Fleche_lsp
 open Petanque_json.Interp
 open Protocol_shell
 
-let do_handle ~fn ~token action =
+let do_handle ?(target = Shell.Target.End) ~fn ~token action =
   match action with
   | Action.Now handler -> handler ~token
   | Action.Doc { uri; handler } ->
     let open Coq.Compat.Result.O in
-    let* doc = fn ~token ~uri |> of_pet_err in
+    let* doc = fn ~target ~token ~uri |> of_pet_err in
     handler ~token ~doc
   | Action.Pos { uri; point; handler } ->
     let open Coq.Compat.Result.O in
-    let* doc = fn ~token ~uri |> of_pet_err in
+    let* doc = fn ~target:(Shell.Target.Position (fst point, snd point)) ~token ~uri |> of_pet_err in
     handler ~token ~doc ~point
 
 (* Duplicate with lsp_core *)
@@ -44,7 +44,17 @@ let request ~fn ~token ~id ~method_ ~params =
       let message = Format.asprintf "method %s not found" method_ in
       Error (Request.Error.make code message)
   in
-  let do_handle = do_handle ~fn in
+  (* 参数的类型检查仍由 do_request 执行；只为合法 start/root 选择更窄的文档目标。 *)
+  let target =
+    if String.equal method_ Petanque_json.Protocol.Start.method_ then
+      match List.assoc_opt "thm" params with
+      | Some (`String thm) -> Shell.Target.Theorem thm
+      | _ -> Shell.Target.End
+    else if String.equal method_ Petanque_json.Protocol.GetRootState.method_ then
+      Shell.Target.Root
+    else Shell.Target.End
+  in
+  let do_handle = do_handle ~target ~fn in
   match handle_request ~do_handle ~unhandled ~token ~method_ ~params with
   | Ok result -> Lsp.Base.Response.mk_ok ~id ~result
   | Error Request.Error.{ code; payload; feedback } ->
@@ -54,7 +64,8 @@ let request ~fn ~token ~id ~method_ ~params =
     Lsp.Base.Response.mk_error ~id ~code ~message ~data
 
 type doc_handler =
-     token:Coq.Limits.Token.t
+     target:Shell.Target.t
+  -> token:Coq.Limits.Token.t
   -> uri:Lang.LUri.File.t
   -> Fleche.Doc.t Petanque.Agent.R.t
 

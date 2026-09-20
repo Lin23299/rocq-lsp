@@ -132,6 +132,7 @@ module Node = struct
     ; ast : Ast.t option  (** Ast of node *)
     ; state : Coq.State.t  (** (Full) State of node *)
     ; diags : Coq.Pp_t.t Lang.Diagnostic.t list
+    ; anomaly : bool
     ; messages : Message.t list
     ; info : Info.t
     }
@@ -348,6 +349,11 @@ let update_toc_node toc node =
     update_toc_info toc ast_info node
 
 let rebuild_toc nodes = List.fold_left update_toc_node SM.empty nodes
+(* CCV：异常类别在诊断化之前保留，不能从文字或 Completion.Failed 猜。 *)
+let error_is_anomaly = function
+  | Coq.Protect.Error.Anomaly _ -> true
+  | User _ -> false
+
 
 let init_fname ~uri =
   let file = Lang.LUri.File.to_string_file uri in
@@ -363,7 +369,7 @@ let drange ~lines =
   let end_ = Point.{ line = 0; character = llen; offset = llen } in
   Range.{ start; end_ }
 
-let process_init_feedback ~lines ~stats ~global_stats state feedback =
+let process_init_feedback ?(anomaly = false) ~lines ~stats ~global_stats state feedback =
   let messages = List.map (Node.Message.feedback_to_message ~lines) feedback in
   if not (Lang.Compat.List.is_empty messages) then
     let drange = drange ~lines in
@@ -372,7 +378,7 @@ let process_init_feedback ~lines ~stats ~global_stats state feedback =
     let info = Node.Info.make ~parsing_time ?stats ~global_stats () in
     let range = drange in
     let prev = None in
-    [ { Node.range; prev; ast = None; state; diags; messages; info } ]
+    [ { Node.range; prev; ast = None; state; diags; anomaly; messages; info } ]
   else []
 
 (* Memoized call to [Coq.Init.doc_init] *)
@@ -460,8 +466,13 @@ let handle_doc_creation_exec ~token ~env ~uri ~languageId ~version ~contents =
   let stats = Some stats in
   let global_stats = Stats.Global.dump () in
   let nodes =
+    let anomaly =
+      match r with
+      | Coq.Protect.R.Completed (Error e) -> error_is_anomaly e
+      | _ -> false
+    in
     let lines = contents.Contents.lines in
-    process_init_feedback ~lines ~stats ~global_stats state
+    process_init_feedback ~anomaly ~lines ~stats ~global_stats state
       (feedback @ extra_feedback)
     @ doc.nodes
   in
@@ -830,6 +841,7 @@ let interp_and_info ~token ~parsing_time ~st ~files ~doc ast =
 
 type parse_action =
   | EOF of Completion.t (* completed *)
+  | Parse_failure of Lang.Range.t * bool (* consumed span, anomaly *)
   | Skip of
       Lang.Range.t
       * Lang.Range.t (* span of the skipped sentence + last valid token *)
@@ -856,15 +868,19 @@ let parse_action ~token ~lines ~st last_tok doc_handle =
     | Ok (Some ast) ->
       let () = if Debug.parsing then DDebug.parsed_sentence ~ast in
       (Process ast, [], feedback, time)
-    | Error (Anomaly { range = _; quickFix; msg })
-    | Error (User { range = None; quickFix; msg }) ->
+    | Error ((Anomaly { range = _; quickFix; msg }) as error)
+    | Error ((User { range = None; quickFix; msg }) as error) ->
       (* We don't have a better alternative :(, usually missing error loc here
          means an anomaly, so we stop *)
       let err_range = last_tok in
       let parse_diags =
         [ Diags.error ~err_range ~quickFix ~msg ~stm_range:err_range () ]
       in
-      (EOF (Failed last_tok), parse_diags, feedback, time)
+      (* diagnostic 保留官方 fallback；node 则用 parser 实际消费区间。 *)
+      let end_loc = Coq.Parsing.Parsable.loc doc_handle in
+      let span = Util.build_span start_loc end_loc in
+      let range = Coq.Utils.to_range ~lines span in
+      (Parse_failure (range, error_is_anomaly error), parse_diags, feedback, time)
     | Error (User { range = Some err_range; quickFix; msg }) ->
       Coq.Parsing.discard_to_dot doc_handle;
       let last_tok = Coq.Parsing.Parsable.loc doc_handle in
@@ -891,14 +907,14 @@ type document_action =
       }
   | Interrupted of Lang.Range.t
 
-let unparseable_node ~range ~prev ~parsing_diags ~parsing_feedback ~state
+let unparseable_node ~anomaly ~range ~prev ~parsing_diags ~parsing_feedback ~state
     ~parsing_time =
   let fb_diags, messages = Diags.of_messages ~drange:range parsing_feedback in
   let diags = fb_diags @ parsing_diags in
   let stats = None in
   let global_stats = Stats.Global.dump () in
   let info = Node.Info.make ~parsing_time ?stats ~global_stats () in
-  { Node.range; prev; ast = None; diags; messages; state; info }
+  { Node.range; prev; ast = None; diags; anomaly; messages; state; info }
 
 let assemble_diags ~range ~parsing_diags ~parsing_feedback ~diags ~feedback =
   let parsing_fb_diags, parsing_messages =
@@ -914,7 +930,7 @@ let parsed_node ~range ~prev ~ast ~state ~parsing_diags ~parsing_feedback ~diags
   let diags, messages =
     assemble_diags ~range ~parsing_diags ~parsing_feedback ~diags ~feedback
   in
-  { Node.range; prev; ast = Some ast; diags; messages; state; info }
+  { Node.range; prev; ast = Some ast; diags; anomaly = false; messages; state; info }
 
 let strategy_of_coq_err ~node ~state ~last_tok = function
   | Coq.Protect.Error.Anomaly _ -> Stop (Failed last_tok, node)
@@ -945,17 +961,25 @@ let node_of_coq_result ~token ~doc ~range ~prev ~ast ~st ~parsing_diags
       parsed_node ~range ~prev ~ast ~state:recovery_st ~parsing_diags
         ~parsing_feedback ~diags:err_diags ~feedback ~info
     in
+    let node = { node with Node.anomaly = error_is_anomaly coq_err } in
     strategy_of_coq_err ~node ~state:recovery_st ~last_tok coq_err
 
 (* Build a document node, possibly executing *)
 let document_action ~token ~io ~st ~parsing_diags ~parsing_feedback
     ~parsing_time ~prev ~doc last_tok doc_handle action =
   match action with
+  | Parse_failure (range, anomaly) ->
+    let node =
+      unparseable_node ~anomaly ~range ~prev ~parsing_diags ~parsing_feedback
+        ~state:st ~parsing_time
+    in
+    Stop (Failed last_tok, node)
+
   (* End of file *)
   | EOF completed ->
     let range = Completion.range completed in
     let node =
-      unparseable_node ~range ~prev ~parsing_diags ~parsing_feedback ~state:st
+      unparseable_node ~anomaly:false ~range ~prev ~parsing_diags ~parsing_feedback ~state:st
         ~parsing_time
     in
     Stop (completed, node)
@@ -966,7 +990,7 @@ let document_action ~token ~io ~st ~parsing_diags ~parsing_feedback
     in
     let st = Recovery.handle ~token ~context ~st in
     let node =
-      unparseable_node ~range:span_range ~prev ~parsing_diags ~parsing_feedback
+      unparseable_node ~anomaly:false ~range:span_range ~prev ~parsing_diags ~parsing_feedback
         ~state:st ~parsing_time
     in
     Continue { state = st; last_tok; node }
@@ -1033,7 +1057,7 @@ let log_beyond_target last_tok target =
 let max_errors_node ~state ~range ~prev =
   let msg = Coq.Pp_t.str "Maximum number of errors reached" in
   let parsing_diags = [ Diags.make range Diags.err msg ] in
-  unparseable_node ~range ~prev ~parsing_diags ~parsing_feedback:[] ~state
+  unparseable_node ~anomaly:false ~range ~prev ~parsing_diags ~parsing_feedback:[] ~state
     ~parsing_time:0.0
 
 module Stop_cond = struct
@@ -1049,7 +1073,7 @@ module Stop_cond = struct
 end
 
 (* main interpretation loop *)
-let process_and_parse ~io ~token ~target ~uri ~version doc last_tok doc_handle =
+let process_and_parse ~stop_before ~io ~token ~target ~uri ~version doc last_tok doc_handle =
   let rec stm doc st (last_tok : Lang.Range.t) prev acc_errors =
     (* Reporting of progress and diagnostics (if dirty) *)
     let doc = send_eager_diagnostics ~io ~uri ~version ~doc in
@@ -1076,6 +1100,10 @@ let process_and_parse ~io ~token ~target ~uri ~version doc last_tok doc_handle =
       let action, parsing_diags, parsing_feedback, parsing_time =
         parse_action ~token ~lines ~st last_tok doc_handle
       in
+      (* CCV：位置落在下一句前的空白时，允许只解析以确定边界，不执行下一句。 *)
+      let stop_here = match action with Process ast -> stop_before ast | _ -> false in
+      if stop_here then set_completion ~completed:(Completion.Stopped last_tok) doc_handle doc
+      else
       (* Execution *)
       let action =
         document_action ~token ~io ~st ~parsing_diags ~parsing_feedback
@@ -1114,10 +1142,10 @@ let process_and_parse ~io ~token ~target ~uri ~version doc last_tok doc_handle =
   let doc = { doc with nodes = List.rev doc.nodes } in
   doc
 
-let process_and_parse ~io ~token ~target ~uri ~version doc last_tok doc_handle =
+let process_and_parse ~stop_before ~io ~token ~target ~uri ~version doc last_tok doc_handle =
   NewProfile.profile "Doc.process_and_parse"
     (fun () ->
-      process_and_parse ~io ~token ~target ~uri ~version doc last_tok doc_handle)
+      process_and_parse ~stop_before ~io ~token ~target ~uri ~version doc last_tok doc_handle)
     ()
 
 let log_doc_completion (completed : Completion.t) =
@@ -1152,7 +1180,7 @@ let loc_after ~lines ~uri (r : Lang.Range.t) =
   }
 
 (** Setup parser and call the main routine *)
-let resume_check ~io ~token ~(last_tok : Lang.Range.t) ~doc ~target =
+let resume_check ~stop_before ~io ~token ~(last_tok : Lang.Range.t) ~doc ~target =
   let uri, version, contents = (doc.uri, doc.version, doc.contents) in
   (* Compute resume point, basically [CLexer.after] + stream setup *)
   let lines = doc.contents.lines in
@@ -1171,10 +1199,10 @@ let resume_check ~io ~token ~(last_tok : Lang.Range.t) ~doc ~target =
         Parsable.make ~loc:resume_loc
           Stream.(of_string ~offset processed_content))
     in
-    process_and_parse ~io ~token ~target ~uri ~version doc last_tok handle
+    process_and_parse ~stop_before ~io ~token ~target ~uri ~version doc last_tok handle
 
 (** Check a document, if it was not completed already *)
-let check ~io ~token ~target ~doc () =
+let check ~stop_before ~io ~token ~target ~doc () =
   match doc.completed with
   | Yes _ ->
     Io.Log.trace "check" "resuming, completed=yes, nothing to do";
@@ -1188,13 +1216,13 @@ let check ~io ~token ~target ~doc () =
     recreate ~token ~doc ~version ~contents
   | Stopped last_tok ->
     DDebug.resume last_tok doc.version;
-    let doc = resume_check ~io ~token ~last_tok ~doc ~target in
+    let doc = resume_check ~stop_before ~io ~token ~last_tok ~doc ~target in
     log_doc_completion doc.completed;
     Util.print_stats ();
     doc
 
-let check ~io ~token ~target ~doc () =
-  NewProfile.profile "Doc.check" (fun () -> check ~io ~token ~target ~doc ()) ()
+let check ?(stop_before = fun _ -> false) ~io ~token ~target ~doc () =
+  NewProfile.profile "Doc.check" (fun () -> check ~stop_before ~io ~token ~target ~doc ()) ()
 
 let save ~token ~doc =
   match doc.completed with

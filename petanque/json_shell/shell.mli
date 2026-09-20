@@ -25,8 +25,12 @@ val set_workspace :
   -> root:Lang.LUri.File.t
   -> unit Agent.R.t
 
+module Target : sig
+  type t = End | Root | Position of int * int | Theorem of string
+end
+
 val build_doc :
-  token:Coq.Limits.Token.t -> uri:Lang.LUri.File.t -> Fleche.Doc.t Agent.R.t
+  target:Target.t -> token:Coq.Limits.Token.t -> uri:Lang.LUri.File.t -> Fleche.Doc.t Agent.R.t
 
 val get_toc :
      token:Coq.Limits.Token.t
