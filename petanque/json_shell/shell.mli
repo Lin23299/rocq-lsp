@@ -29,6 +29,8 @@ module Target : sig
   type t = End | Root | Position of int * int | Theorem of string
 end
 
+val workspace_update : unit -> unit Agent.R.t
+
 val build_doc :
   target:Target.t -> token:Coq.Limits.Token.t -> uri:Lang.LUri.File.t -> Fleche.Doc.t Agent.R.t
 

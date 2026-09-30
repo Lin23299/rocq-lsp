@@ -67,8 +67,27 @@ let set_workspace ~token ~debug ~root =
   let init = Option.get !init_st in
   let open Coq.Compat.Result.O in
   let+ env_ = setup_workspace ~token ~init ~debug ~root in
+  (* 换目录时原生 files 标记仍单调，不能重新命中先前目录的 Require memo。 *)
+  let files = match !env with
+    | None -> env_.Fleche.Doc.Env.files
+    | Some previous -> Coq.Files.bump previous.Fleche.Doc.Env.files
+  in
+  let env_ = Fleche.Doc.Env.make ~init:env_.init ~workspace:env_.workspace ~files in
   Hashtbl.clear documents;
   env := Some env_
+
+(* 复用 LSP workspace_update 的原生操作，但应用到 shell 自己的文档表。 *)
+let workspace_update () =
+  let old_env = Option.get !env in
+  let { Fleche.Doc.Env.init; workspace; files } = old_env in
+  let files = Coq.Files.bump files in
+  let updated = Fleche.Doc.Env.make ~init ~workspace ~files in
+  Hashtbl.filter_map_inplace
+    (fun _ doc -> Some (Fleche.Doc.update_env ~doc ~env:updated)) documents;
+  env := Some updated;
+  Fleche.Memo.Intern.clear ();
+  Petanque_json.JAgent.State.clear ();
+  Ok ()
 
 (* likely duplicated somewhere else *)
 let pp_diag fmt { Lang.Diagnostic.message; _ } =
@@ -151,6 +170,9 @@ let build_doc ~target ~token ~uri =
   let key = Lang.LUri.File.to_string_file uri in
   let doc =
     match Hashtbl.find_opt documents key with
+    | Some ({ completed = WorkspaceUpdated _; _ } as doc) ->
+      (* 即使源码没变，也先重建 root/toc；不能命中旧 theorem 节点。 *)
+      Fleche.Doc.bump_version ~token ~version:(doc.version + 1) ~raw doc
     | Some doc when String.equal raw doc.contents.raw -> doc
     | Some doc -> Fleche.Doc.bump_version ~token ~version:(doc.version + 1) ~raw doc
     | None ->

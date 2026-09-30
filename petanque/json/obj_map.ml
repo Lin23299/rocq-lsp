@@ -8,6 +8,7 @@ end
 
 module type S = sig
   type t [@@deriving yojson]
+  val clear : unit -> unit
 end
 
 module Make (O : Obj) : S with type t = O.t = struct
@@ -17,6 +18,8 @@ module Make (O : Obj) : S with type t = O.t = struct
   module Memo = Hashtbl.Make (Int)
 
   let memo = Memo.create 1000
+  (* 已发出的整数不复用；更新后旧句柄必须拒绝。 *)
+  let clear () = Memo.clear memo
 
   let dump_memo () =
     let keys = Memo.to_seq_keys memo |> List.of_seq in

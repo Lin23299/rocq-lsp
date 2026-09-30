@@ -34,6 +34,8 @@ let feedback_to_data fbs =
 let request ~fn ~token ~id ~method_ ~params =
   let unhandled ~token ~method_ =
     match method_ with
+    | s when String.equal WorkspaceUpdate.method_ s ->
+      do_handle ~fn ~token (do_request (module WorkspaceUpdate) ~params)
     | s when String.equal SetWorkspace.method_ s ->
       do_handle ~fn ~token (do_request (module SetWorkspace) ~params)
     | s when String.equal TableOfContents.method_ s ->

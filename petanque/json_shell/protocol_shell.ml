@@ -8,6 +8,29 @@
 module Lsp = Fleche_lsp
 open Petanque_json
 
+module WorkspaceUpdate = struct
+  let method_ = "coq/workspace_update"
+
+  module Params = struct
+    type t = unit
+    let to_yojson () = `Assoc []
+    let of_yojson = function
+      | `Assoc [] -> Ok ()
+      | _ -> Error "workspace_update takes no parameters"
+  end
+
+  module Response = struct
+    type t = unit [@@deriving yojson]
+  end
+
+  module Handler = struct
+    module Params = Params
+    module Response = Response
+    let handler =
+      Protocol.HType.Immediate (fun ~token:_ () -> Shell.workspace_update ())
+  end
+end
+
 (** [set_workspace { debug; root }] sets the current workspace to the directory
     specified in [root] *)
 module SetWorkspace = struct
