@@ -142,6 +142,7 @@ type operation = {
 }
 
 let sources : (string, source) Hashtbl.t = Hashtbl.create 17
+let budgets : (string, unit) Hashtbl.t = Hashtbl.create 17
 let uri_counter = ref 0
 let operations : (T.op_binding * operation) list ref = ref []
 let tables = Mutex.create ()
@@ -240,6 +241,8 @@ let step_reply request =
             | None ->
                 begin match source_bytes script_source with
                 | Error _ ->
+                    T.make_protocol_error header T.invalid_input T.not_admitted T.fact_unknown
+                | Ok _ when not (Hashtbl.mem budgets (T.Id.get (T.op_binding_budget binding))) ->
                     T.make_protocol_error header T.invalid_input T.not_admitted T.fact_unknown
                 | Ok _ ->
                     let operation =
@@ -362,6 +365,10 @@ let step_reply request =
               T.make_finished header key
           | None ->
               T.make_protocol_error header T.unknown_operation T.not_admitted T.fact_unknown)
+  | T.RegisterBudgetRequest (header, budget, grant) ->
+      with_tables (fun () ->
+          Hashtbl.replace budgets (T.Id.get budget) ();
+          T.make_budget_registered header budget grant (uint 1L))
   | T.OtherRequest (header, _) ->
       T.make_protocol_error header T.invalid_input T.not_admitted T.fact_unknown
 
