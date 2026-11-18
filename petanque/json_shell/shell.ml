@@ -149,25 +149,22 @@ let make_doc ~token ~uri ~raw =
   Fleche.Doc.create ~token ~env:(Option.get !env) ~uri ~languageId
     ~version:0 ~raw
 
-(* U3 single-step seam: execute the first command whose parser start is at or
-   after [cursor], then stop before the following command. No whole-document
-   Doc.run is used. *)
+(* 如同 until_theorem，只把目标推进一个位置，解析恢复节点也会停，不越过坏句。 *)
 let step_doc ~token ~(doc : Fleche.Doc.t) ~cursor =
-  let seen = ref false in
-  let stop_before ast =
-    match Coq.Ast.loc ast with
-    | None -> false
-    | Some loc ->
-        let range = Coq.Utils.to_range ~lines:doc.contents.lines loc in
-        if range.start.offset < cursor then false
-        else if !seen then true
-        else (seen := true; false)
-  in
-  let doc =
-    Fleche.Doc.check ~stop_before ~io ~token
-      ~target:Fleche.Doc.Target.End ~doc ()
-  in
-  (doc, !seen)
+  let p = last_point doc in
+  let target = Fleche.Doc.Target.Position (p.line, p.character + 1) in
+  let doc = Fleche.Doc.check ~io ~token ~target ~doc () in
+  let node = List.find_opt (fun (n : Fleche.Doc.Node.t) ->
+      n.range.end_.offset > cursor &&
+      (Stdlib.Option.is_some n.ast || List.exists Lang.Diagnostic.is_error n.diags)) doc.nodes in
+  let outcome = match node, doc.completed with
+    | Some n, _ when List.exists Lang.Diagnostic.is_error n.diags ->
+        `Error (if Stdlib.Option.is_none n.ast then `Parse else `Execute)
+    | _, Failed _ | _, WorkspaceUpdated _ -> `Unknown
+    | Some n, _ when Stdlib.Option.is_some n.ast -> `Step n.range.end_.offset
+    | None, Yes _ -> `Eof
+    | _ -> `Unknown in
+  doc, outcome
 
 let build_doc ~target ~token ~uri =
   let open Coq.Compat.Result.O in

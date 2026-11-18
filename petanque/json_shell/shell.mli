@@ -35,7 +35,7 @@ val make_doc :
 
 val step_doc :
   token:Coq.Limits.Token.t -> doc:Fleche.Doc.t -> cursor:int ->
-  Fleche.Doc.t * bool
+  Fleche.Doc.t * [ `Step of int | `Eof | `Error of [ `Parse | `Execute ] | `Unknown ]
 
 val build_doc :
   target:Target.t -> token:Coq.Limits.Token.t -> uri:Lang.LUri.File.t -> Fleche.Doc.t Agent.R.t
