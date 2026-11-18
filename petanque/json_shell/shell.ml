@@ -145,6 +145,30 @@ let checked_prefix ?through doc =
       else Petanque.Agent.Error.coq message in
     Error (Petanque.Agent.Error.make_request error)
 
+let make_doc ~token ~uri ~raw =
+  Fleche.Doc.create ~token ~env:(Option.get !env) ~uri ~languageId
+    ~version:0 ~raw
+
+(* U3 single-step seam: execute the first command whose parser start is at or
+   after [cursor], then stop before the following command. No whole-document
+   Doc.run is used. *)
+let step_doc ~token ~(doc : Fleche.Doc.t) ~cursor =
+  let seen = ref false in
+  let stop_before ast =
+    match Coq.Ast.loc ast with
+    | None -> false
+    | Some loc ->
+        let range = Coq.Utils.to_range ~lines:doc.contents.lines loc in
+        if range.start.offset < cursor then false
+        else if !seen then true
+        else (seen := true; false)
+  in
+  let doc =
+    Fleche.Doc.check ~stop_before ~io ~token
+      ~target:Fleche.Doc.Target.End ~doc ()
+  in
+  (doc, !seen)
+
 let build_doc ~target ~token ~uri =
   let open Coq.Compat.Result.O in
   let* raw = read_raw ~uri in
