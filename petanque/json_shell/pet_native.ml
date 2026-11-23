@@ -176,6 +176,7 @@ let handshake boot fd channel =
 (* 共享运行态已迁入 Pet_registry（spec §1）：sources/budgets/operations/
    highest_seen/retired_through/with_tables 统一走 Registry。 *)
 module Registry = Pet_native_support.Pet_registry
+module Refresh = Pet_native_support.Pet_environment_refresh
 
 let with_tables = Registry.with_tables
 
@@ -290,13 +291,14 @@ let rec source_loop fd =
 
 (* —— 控制通道（fd 5，spec §1.3）：ReadControl / RequestCancel —— *)
 
-(* phase 推导：执行中（pull 已标记 Executing）=Active；已有终态（terminal/aux）
-   =TerminalPhase；否则 Idle。Settling（中断待落定）在块 E 接线后补充。 *)
+(* phase 推导：执行中（pull 已标记 Executing）=Active；中断已落定待 Settle=Settling；
+   已有终态（terminal/aux）=TerminalPhase；否则 Idle。 *)
 let control_phase_of (op : Registry.operation) =
   if op.terminal <> None || op.aux <> None then T.TerminalPhase
   else
     match op.state with
     | Registry.Executing -> T.Active
+    | Registry.Retiring -> T.Settling
     | _ -> T.Idle
 
 let control_snapshot_of (op : Registry.operation) =
@@ -442,6 +444,61 @@ let status header (op : Registry.operation) =
         ~pending:op.pending ~terminal:op.terminal ~last_ack:op.last_ack
         ~stop_requested:op.stop_requested
 
+(* 中断落定（spec §1.2）：在原恢复期限内用新 token 从父快照恢复；
+   恢复成功才发布 Interrupted 终态（stopped/synchronized=true），否则保留
+   Unknown（state=Retiring，无终态）。pull 与 SettleInterrupt 共用：
+   驱动端 pull 只接受 Receipt/Terminal/PastUnavailable（Status 会隔离实例），
+   所以可恢复的中断必须在 pull 内联落定；SettleInterrupt 是幂等/兜底路径。 *)
+let settle_interrupted_reply header (op : Registry.operation) snapshot =
+  let retiring () =
+    op.state <- Registry.Retiring;
+    T.make_retiring_status header op.binding
+      ~highest_seen:(uint !Registry.highest_seen)
+      ~retired_through:(uint !Registry.retired_through)
+      ~stop_requested:op.stop_requested
+  in
+  let expired =
+    match Registry.find_budget (T.op_binding_budget op.binding) with
+    | Some budget -> Registry.deadline_expired budget `Recovery
+    | None -> true (* 无预算可核：按过期处理，不冒险恢复 *)
+  in
+  if expired then retiring ()
+  else begin
+    (* 原恢复期限未过：新 token（恢复段不可再被取消，原子段语义正确）。 *)
+    let token = Coq.Limits.create_atomic () in
+    match
+      (try Ok (Shell.restore_sentence ~token ~snapshot ~cursor:(Int64.to_int op.cursor))
+       with _ -> Error ())
+    with
+    | Error () -> retiring ()
+    | Ok doc ->
+        if match doc.Fleche.Doc.completed with
+          | Fleche.Doc.Completion.Failed _ -> true | _ -> false
+        then retiring ()
+        else begin
+          (* 恢复成功：代际+1、清中断账本、发布终态。 *)
+          op.doc <- Some doc;
+          op.cancel_generation <- Int64.succ op.cancel_generation;
+          op.stop_requested <- false;
+          op.interrupt_snapshot <- None;
+          op.token <- None;
+          op.state <- Registry.Ready;
+          let seq = uint (Int64.succ op.acked_through) in
+          let record =
+            T.make_interrupted_terminal op.binding seq
+              ~stopped:(T.FKnown true)
+              ~synchronized:(T.FKnown true)
+              ~last_acked:(T.FKnown op.parent)
+              ~pending:T.FNotApplicable
+              ~recoverable:(T.FKnown true)
+              ~diagnostic:T.FUnknown
+              ~extent:T.CompleteKnown
+          in
+          op.terminal <- Some record;
+          T.terminal_reply header record
+        end
+  end
+
 let pull header (op : Registry.operation) =
   (* 普通可取消 token：本 fork 的 create_atomic 是不可 set 的原子段，
      会完全关闭控制通道取消；跨线程 set 由 bool ref 后端天然支持。
@@ -458,8 +515,13 @@ let pull header (op : Registry.operation) =
             (Unix.getpid ()) !uri_counter) |> Lang.LUri.File.of_uri |> get in
         let raw = with_tables (fun () -> Option.get (Registry.source_bytes op.source)) in
         Shell.make_doc ~token ~uri ~raw in
+  (* 步前快照（spec §1.2）：中断真实发生时作为恢复父快照。 *)
+  let snapshot = Shell.snapshot_doc doc in
   let doc, outcome = Shell.step_doc ~token ~doc ~cursor:(Int64.to_int op.cursor) in
-  with_tables (fun () -> op.state <- Registry.Ready);
+  begin match outcome with
+    | `Interrupted _ -> () (* 中断路径下面统一入账，不回 Ready *)
+    | _ -> with_tables (fun () -> op.state <- Registry.Ready)
+  end;
   let seq = uint (Int64.succ op.acked_through) in
   let finish record = op.terminal <- Some record; T.terminal_reply header record in
   match outcome with
@@ -467,10 +529,13 @@ let pull header (op : Registry.operation) =
                       ~cursor:(uint op.cursor))
   | `Error stage -> finish (T.error_terminal op.binding seq ~parse:(stage = `Parse)
                               ~last_valid:op.parent ~group:None)
-  | `Unknown when Coq.Limits.Token.is_set token ->
-      (* 取消真实到达但本块尚未接线中断落定：按 spec 口径不发布新身份、无终态，
-         status 报 Ready 且 terminal=FUnknown（块 E 的 SettleInterrupt 接恢复）。 *)
-      status header op
+  | `Interrupted _stage ->
+      (* 中断真实发生（spec §1.2）：先入父快照账本，再尝试原恢复期限内联落定；
+         驱动端 pull 只接受 Receipt/Terminal/PastUnavailable，可恢复的中断必须
+         在此回复 Interrupted 终态；恢复失败保留 Unknown（Retiring status，
+         极端路径——驱动会隔离实例，诚实不伪造）。 *)
+      with_tables (fun () -> op.interrupt_snapshot <- Some snapshot);
+      with_tables (fun () -> settle_interrupted_reply header op snapshot)
   | `Unknown -> fail "nativeface: single-step outcome unknown"
   | `Step stop ->
       let node = node_id op (T.U.get seq) and next_cursor = uint (Int64.of_int stop) in
@@ -649,9 +714,18 @@ let step_reply ~request request_view =
   | T.FinishOperationRequest (header, binding, key) ->
       with_tables (fun () ->
           match Registry.find_operation binding with
-          | Some { terminal = Some t; _ } when T.receipt_key_equal (T.terminal_key t) key ->
-              T.make_finished header key
-          | Some _ -> T.make_protocol_error header T.BindingConflict T.ExistingOperation T.fact_unknown
+          | Some operation ->
+              (match operation.terminal, operation.aux with
+               | Some t, _ when T.receipt_key_equal (T.terminal_key t) key ->
+                   T.make_finished header key
+               | _, Some aux
+                 when T.receipt_key_equal (T.locator_terminal_key aux) key ->
+                   (* aux 终态（locate/fork/refresh 等）同样可结：key 取
+                      locator_terminal_key。 *)
+                   T.make_finished header key
+               | _ ->
+                   T.make_protocol_error header T.BindingConflict
+                     T.ExistingOperation T.fact_unknown)
           | None ->
               T.make_protocol_error header T.unknown_operation T.not_admitted T.fact_unknown)
   | T.RegisterBudgetRequest (header, budget, _grant) ->
@@ -906,8 +980,30 @@ let step_reply ~request request_view =
                         end)))
   | T.SyncSourceRequest (header, _, _, _, _, _, _) ->
       T.make_protocol_error header T.invalid_input T.not_admitted T.fact_unknown
-  | T.RefreshEnvironmentRequest (header, _, _, _, _) ->
-      T.make_protocol_error header T.invalid_input T.not_admitted T.fact_unknown
+  | T.RefreshEnvironmentRequest (header, binding, old_env, new_env, publication) ->
+      (* NN04：路由 Pet_environment_refresh（模块锁→Registry 锁，路由侧不持
+         Registry 锁调用）。 *)
+      let admitted =
+        with_tables (fun () ->
+            match Registry.find_operation binding with
+            | Some _ -> `Existing
+            | None ->
+                (match admit_new header binding request with
+                 | `Rejected reply -> `Rejected reply
+                 | `Admitted ->
+                     Registry.highest_seen := T.U.get (T.op_seq binding);
+                     let line_id =
+                       match T.op_binding_line_owner binding with
+                       | context, _, _ -> context
+                     in
+                     Registry.register_operation binding
+                       (make_aux_operation binding line_id);
+                     `Fresh))
+      in
+      (match admitted with
+       | `Rejected reply -> reply
+       | `Existing | `Fresh ->
+           Refresh.refresh ~header ~binding ~old_env ~new_env ~publication)
   | T.QueryRequest (header, _, _, _, _) ->
       T.make_protocol_error header T.invalid_input T.not_admitted T.fact_unknown
   | T.InspectRequest (header, _, _, _, _) ->
@@ -916,8 +1012,25 @@ let step_reply ~request request_view =
       T.make_protocol_error header T.invalid_input T.not_admitted T.fact_unknown
   | T.CheckpointRequest (header, _) ->
       T.make_protocol_error header T.invalid_input T.not_admitted T.fact_unknown
-  | T.SettleInterruptRequest (header, _) ->
-      T.make_protocol_error header T.invalid_input T.not_admitted T.fact_unknown
+   | T.SettleInterruptRequest (header, binding) ->
+      (* spec §1.2 中断落定（幂等/兜底）：pull 内联落定已发布终态 ⇒ 原样重放
+         （驱动端 settle 期待 Terminal，protocol_error 会隔离实例）；
+         未落定且有父快照 ⇒ 原恢复期限内恢复；否则 invalid_state。 *)
+      with_tables (fun () ->
+          match Registry.find_operation binding with
+          | None ->
+              T.make_protocol_error header T.unknown_operation T.not_admitted T.fact_unknown
+          | Some op ->
+              (match op.terminal with
+               | Some record -> T.terminal_reply header record
+               | None ->
+                   (match op.interrupt_snapshot with
+                    | None ->
+                        (* 无在途中断（取消未请求或未真实发生）⇒ invalid_state。 *)
+                        T.make_protocol_error header T.invalid_state T.not_admitted
+                          T.fact_unknown
+                    | Some snapshot ->
+                        settle_interrupted_reply header op snapshot)))
   | T.OtherRequest (header, _) ->
       T.make_protocol_error header T.invalid_input T.not_admitted T.fact_unknown
 

@@ -149,7 +149,11 @@ let make_doc ~token ~uri ~raw =
   Fleche.Doc.create ~token ~env:(Option.get !env) ~uri ~languageId
     ~version:0 ~raw
 
-(* 如同 until_theorem，只把目标推进一个位置，解析恢复节点也会停，不越过坏句。 *)
+(* 如同 until_theorem，只把目标推进一个位置，解析恢复节点也会停，不越过坏句。
+   中断（spec §1.2）：Coq.Protect.R.Interrupted / Sys.Break 真实发生时 Fleche 把
+   完成态落成 Stopped——判据 = check 后 token 已被 set 且无新执行节点/错误诊断。
+   stage 区分：解析中断走 EOF 分支会留下一个 ast=None、无诊断、区间不越过
+   cursor 的空节点 ⇒ `Parse；无法区分时归 `Execute（保守面：两侧恢复路径相同）。 *)
 let step_doc ~token ~(doc : Fleche.Doc.t) ~cursor =
   let p = last_point doc in
   let target = Fleche.Doc.Target.Position (p.line, p.character + 1) in
@@ -157,14 +161,52 @@ let step_doc ~token ~(doc : Fleche.Doc.t) ~cursor =
   let node = List.find_opt (fun (n : Fleche.Doc.Node.t) ->
       n.range.end_.offset > cursor &&
       (Stdlib.Option.is_some n.ast || List.exists Lang.Diagnostic.is_error n.diags)) doc.nodes in
+  let interrupted_stage () =
+    match List.rev doc.nodes with
+    | last :: _ when Stdlib.Option.is_none (Fleche.Doc.Node.ast last)
+                    && not (List.exists Lang.Diagnostic.is_error (Fleche.Doc.Node.diags last))
+                    && last.range.end_.offset <= cursor -> `Parse
+    | _ -> `Execute
+  in
   let outcome = match node, doc.completed with
     | Some n, _ when List.exists Lang.Diagnostic.is_error n.diags ->
         `Error (if Stdlib.Option.is_none n.ast then `Parse else `Execute)
     | _, Failed _ | _, WorkspaceUpdated _ -> `Unknown
     | Some n, _ when Stdlib.Option.is_some n.ast -> `Step n.range.end_.offset
     | None, Yes _ -> `Eof
+    | None, Stopped _ when Coq.Limits.Token.is_set token -> `Interrupted (interrupted_stage ())
     | _ -> `Unknown in
   doc, outcome
+
+(* —— CCV 中断/环境三件套（spec §1.2/§2）—— *)
+
+(* 步前快照：Fleche doc 为共享不可变结构，纯记录（= 传回同一 doc）。 *)
+let snapshot_doc (doc : Fleche.Doc.t) = doc
+
+(* 用新 token 从父快照恢复（spec §1.2）：丢弃中断产生的半成品节点（快照本身不含
+   它们），重放同一句的目标定位（Position），stop_before 命中 cursor 起始的句子
+   ⇒ 停在中断句之前。返回 doc 的 completed 允许 Stopped。 *)
+let restore_sentence ~token ~(snapshot : Fleche.Doc.t) ~cursor =
+  let p = last_point snapshot in
+  let target = Fleche.Doc.Target.Position (p.line, p.character + 1) in
+  let stop_before ast =
+    match Coq.Ast.loc ast with
+    | None -> false
+    | Some loc ->
+        let r = Coq.Utils.to_range ~lines:snapshot.contents.lines loc in
+        r.start.offset >= cursor
+  in
+  Fleche.Doc.check ~stop_before ~io ~token ~target ~doc:snapshot ()
+
+(* NN04 环境三件套：快照当前 env；安装新 env（旧 documents 全失效，调用方负责
+   重建材料真实可用）；读回 !env 供物理同一性核验。 *)
+let env_snapshot () = !env
+
+let install_env (new_env : Fleche.Doc.Env.t) =
+  env := Some new_env;
+  Hashtbl.clear documents
+
+let readback_env () = !env
 
 let build_doc ~target ~token ~uri =
   let open Coq.Compat.Result.O in

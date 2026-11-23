@@ -34,8 +34,24 @@ val make_doc :
   Fleche.Doc.t
 
 val step_doc :
-  token:Coq.Limits.Token.t -> doc:Fleche.Doc.t -> cursor:int ->
-  Fleche.Doc.t * [ `Step of int | `Eof | `Error of [ `Parse | `Execute ] | `Unknown ]
+     token:Coq.Limits.Token.t -> doc:Fleche.Doc.t -> cursor:int ->
+     Fleche.Doc.t *
+     [ `Step of int | `Eof | `Error of [ `Parse | `Execute ] | `Unknown
+     | `Interrupted of [ `Parse | `Execute ] ]
+
+(** [snapshot_doc doc] 步前快照：共享不可变结构，纯记录（传回同一 doc）。 *)
+val snapshot_doc : Fleche.Doc.t -> Fleche.Doc.t
+
+(** [restore_sentence ~token ~snapshot ~cursor] 用新 token 从父快照恢复：重放
+    同一句的目标定位（Position），停在中断句之前。 *)
+val restore_sentence :
+  token:Coq.Limits.Token.t -> snapshot:Fleche.Doc.t -> cursor:int -> Fleche.Doc.t
+
+(** NN04 环境三件套：快照当前 env / 安装新 env（旧 documents 全失效）/
+    读回 !env 供物理同一性核验。 *)
+val env_snapshot : unit -> Fleche.Doc.Env.t option
+val install_env : Fleche.Doc.Env.t -> unit
+val readback_env : unit -> Fleche.Doc.Env.t option
 
 val build_doc :
   target:Target.t -> token:Coq.Limits.Token.t -> uri:Lang.LUri.File.t -> Fleche.Doc.t Agent.R.t
