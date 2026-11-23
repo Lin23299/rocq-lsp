@@ -178,6 +178,7 @@ let handshake boot fd channel =
 module Registry = Pet_native_support.Pet_registry
 module Refresh = Pet_native_support.Pet_environment_refresh
 module Sync = Pet_native_support.Pet_source_sync
+module Checkpoint_dispatch = Pet_native_support.Pet_checkpoint_dispatch
 
 let with_tables = Registry.with_tables
 
@@ -258,14 +259,13 @@ let rec source_loop fd =
         let request = get (T.decode_source_request S.message_limits raw) in
         Some (get (T.encode_source_reply S.message_limits (source_handle request)))
     | Some ("checkpoint_blob_begin" | "checkpoint_blob_chunk" | "checkpoint_blob_finish") ->
-        (* 本 item 未接 checkpoint 上传分支：通道内 protocol_error 占位。 *)
+        (* checkpoint 上传分支（spec §3）：路由 Pet_checkpoint_dispatch。 *)
         (match T.decode_checkpoint_blob_request S.message_limits raw with
          | Ok request ->
-             let header, _ = T.checkpoint_blob_request_view request in
              Some
                (get
                   (T.encode_checkpoint_blob_reply S.message_limits
-                     (T.checkpoint_blob_error header T.invalid_input T.not_admitted)))
+                     (Checkpoint_dispatch.serve_upload request)))
          | Error _ ->
              (* 解码失败：尽力从帧内投影可回显 header；拿不到则丢弃，不伪造。 *)
              (match frame_header raw with
@@ -413,22 +413,26 @@ let rec view_loop fd =
                   Some (view_channel_error_encoded header kind)
               | None -> None))
     | Some ("checkpoint_blob_pull" | "checkpoint_blob_ack" | "checkpoint_blob_release") ->
-        (* 本 item 未接 checkpoint 下载分支：通道内 protocol_error 占位；
-           解码失败时尽力回显 header，拿不到则丢弃该帧（不伪造 header）。 *)
+        (* checkpoint 下载/释放分支（spec §3）：pull/ack 归下载，release 也走
+           view 通道；解码失败时尽力回显 header，拿不到则丢弃（不伪造）。 *)
         (match T.decode_checkpoint_blob_request S.message_limits raw with
          | Ok request ->
-             let header, _ = T.checkpoint_blob_request_view request in
+             let reply =
+               let _, blob_view = T.checkpoint_blob_request_view request in
+               match blob_view with
+               | T.BlobReleaseRequest _ -> Checkpoint_dispatch.serve_release request
+               | _ -> Checkpoint_dispatch.serve_download request
+             in
              Some
                (get
-                  (T.encode_checkpoint_blob_reply S.message_limits
-                     (T.checkpoint_blob_error header T.unknown_operation T.not_admitted)))
+                  (T.encode_checkpoint_blob_reply S.message_limits reply))
          | Error _ ->
              (match frame_header raw with
               | Some header ->
                   Some
                     (get
                        (T.encode_checkpoint_blob_reply S.message_limits
-                          (T.checkpoint_blob_error header T.unknown_operation T.not_admitted)))
+                          (T.checkpoint_blob_error header T.invalid_input T.not_admitted)))
               | None -> None))
     | _ ->
         (* 未知 method：尽力回错；拿不到 header 则丢弃。 *)
@@ -1051,8 +1055,10 @@ let step_reply ~request request_view =
       T.make_protocol_error header T.invalid_input T.not_admitted T.fact_unknown
   | T.EndScopeRequest (header, _, _, _) ->
       T.make_protocol_error header T.invalid_input T.not_admitted T.fact_unknown
-  | T.CheckpointRequest (header, _) ->
-      T.make_protocol_error header T.invalid_input T.not_admitted T.fact_unknown
+  | T.CheckpointRequest (header, view) ->
+      (* NC04/NC06/NC08：路由 Pet_checkpoint_dispatch（admit + make_aux_operation
+         在 dispatch 内，line 记 binding.context）。 *)
+      Checkpoint_dispatch.run_request ~request ~header ~view
    | T.SettleInterruptRequest (header, binding) ->
       (* spec §1.2 中断落定（幂等/兜底）：pull 内联落定已发布终态 ⇒ 原样重放
          （驱动端 settle 期待 Terminal，protocol_error 会隔离实例）；
@@ -1089,6 +1095,8 @@ let serve () =
   Registry.set_input_quota (T.U.get (T.boot_input_quota boot));
   (* NN03：boot 绑定注入源码同步模块（线表文档构造/视图配额用）。 *)
   Sync.init ~boot;
+  (* item 3：boot 绑定注入 checkpoint 分发（预算/配额/epoch 核对用）。 *)
+  Checkpoint_dispatch.init ~boot;
   handshake boot ordinary T.Ordinary;
   handshake boot control T.Control;
   handshake boot source T.Source;

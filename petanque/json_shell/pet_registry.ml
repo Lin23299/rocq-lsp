@@ -118,6 +118,11 @@ let add_budget (budget : T.native_budget) =
 
 let find_budget budget_id = Hashtbl.find_opt budgets (T.Id.get budget_id)
 
+(* budget 迭代（须在 with_tables 内调用）：checkpoint transfer 按配对矩阵
+   反查所属预算用（transfer 不带 budget id，只能按 operation/control/attempt/
+   seq 逐预算配对）。 *)
+let iter_budgets f = Hashtbl.iter (fun _ budget -> f budget) budgets
+
 (* 任一已登记预算的环境 id（任务预算共享 boot 环境；供环境刷新模块解析初始身份）。
    须在 with_tables 内调用。 *)
 let any_budget_environment () =
