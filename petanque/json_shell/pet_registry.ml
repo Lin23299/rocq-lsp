@@ -34,10 +34,28 @@ type operation = {
   mutable source : T.Id.t;
   mutable doc : Fleche.Doc.t option;         (* 主线/上下文持有 *)
   expected_revision : T.U.t;                 (* 基线保留：BeginLine 期望线版本 *)
+  (* 中断/取消账本（spec §1.2；interrupt_snapshot 与代际递增在块 E 接线） *)
+  mutable cancel_seq_seen : int64;           (* 已见最大取消序号 *)
+  mutable cancel_generation : int64;         (* token 代际：初次 1，恢复成功后 +1 *)
+  mutable stop_requested : bool;
+  mutable token : Coq.Limits.Token.t option; (* 当前/最近一次执行的 token（原子） *)
+  mutable interrupt_snapshot : Fleche.Doc.t option; (* 中断父快照，SettleInterrupt 用 *)
+  mutable last_cancel_ack : T.control_reply option;  (* 等值取消幂等重放原 ACK *)
+}
+
+(* 线注册表（spec §1.1）：BeginLine 建主线，fork 建探索线，select 迁移 frontier。 *)
+type line_kind = Mainline | Exploration
+
+type line_state = {
+  mutable revision : int64;
+  mutable frontier : T.Id.t;
+  mutable group : (T.Id.t * int64) option;
+  kind : line_kind;
 }
 
 let sources : (string, source) Hashtbl.t = Hashtbl.create 17
 let budgets : (string, T.native_budget) Hashtbl.t = Hashtbl.create 17
+let lines : (string, line_state) Hashtbl.t = Hashtbl.create 17
 
 let tables = Mutex.create ()
 
@@ -56,6 +74,7 @@ let input_reserved = ref 0L
 let init () =
   Hashtbl.reset sources;
   Hashtbl.reset budgets;
+  Hashtbl.reset lines;
   operations := [];
   highest_seen := 0L;
   retired_through := 0L;
@@ -70,6 +89,23 @@ let register_operation binding operation =
   operations := (binding, operation) :: !operations
 
 let iter_operations f = List.iter (fun (_, operation) -> f operation) !operations
+
+(* 控制通道按操作 id 查找（ReadControl/RequestCancel 只带 id）。 *)
+let find_operation_by_id operation_id =
+  List.find_opt
+    (fun (known, _) ->
+      T.Id.get (T.op_binding_operation known) = T.Id.get operation_id)
+    !operations
+  |> Option.map snd
+
+(* 线表（须在 with_tables 内调用）。 *)
+let register_line line_id ~revision ~frontier ~group ~kind =
+  Hashtbl.replace lines (T.Id.get line_id) { revision; frontier; group; kind }
+
+let find_line line_id = Hashtbl.find_opt lines (T.Id.get line_id)
+
+let iter_lines f =
+  Hashtbl.iter (fun key state -> f key state) lines
 
 (* budget 存完整 T.native_budget：同内容（budget_equal）幂等，异内容冲突。 *)
 let add_budget (budget : T.native_budget) =

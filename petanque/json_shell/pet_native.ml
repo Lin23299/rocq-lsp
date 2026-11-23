@@ -89,6 +89,70 @@ let base64_decode text =
 
 let limits_backend = T.Control_interrupt
 
+(* —— 帧级 JSON 投影（spec §1.4/§1.5 method 分派用）——
+   只读提取 method 字段与可回显 header；解析不出时返回 None，调用方按
+   「不伪造」口径丢弃或拒绝，绝不编造 header。 *)
+let frame_method raw =
+  match S.decode S.message_limits raw with
+  | Error _ -> None
+  | Ok value ->
+      (match S.view value with
+       | S.View_object fields ->
+           let open S.StringMap in
+           (match find_opt "method" fields with
+            | Some field ->
+                (match S.view field with
+                 | S.View_string name -> Some name
+                 | _ -> None)
+            | None -> None)
+       | _ -> None)
+
+let frame_header raw =
+  match S.decode S.message_limits raw with
+  | Error _ -> None
+  | Ok value ->
+      (match S.view value with
+       | S.View_object fields ->
+           let open S.StringMap in
+           let string_field key map =
+             match find_opt key map with
+             | Some field ->
+                 (match S.view field with
+                  | S.View_string text -> Some text
+                  | _ -> None)
+             | None -> None
+           in
+           let integer_field key map =
+             match find_opt key map with
+             | Some field ->
+                 (match S.view field with
+                  | S.View_integer value -> Some value
+                  | _ -> None)
+             | None -> None
+           in
+           (match find_opt "header" fields with
+            | Some field ->
+                (match S.view field with
+                 | S.View_object header_fields ->
+                     (match
+                       string_field "instance" header_fields,
+                       integer_field "backend_epoch" header_fields,
+                       integer_field "manager_epoch" header_fields,
+                       integer_field "rpc_seq" header_fields
+                      with
+                     | Some instance, Some backend_epoch, Some manager_epoch, Some rpc_seq ->
+                         (match
+                            T.Id.make instance, T.U.make backend_epoch,
+                            T.U.make manager_epoch, T.U.make rpc_seq
+                          with
+                         | Ok instance, Ok backend_epoch, Ok manager_epoch, Ok rpc_seq ->
+                             Some (T.header ~instance ~backend_epoch ~manager_epoch ~rpc_seq)
+                         | _ -> None)
+                     | _ -> None)
+                 | _ -> None)
+            | None -> None)
+       | _ -> None)
+
 let handshake boot fd channel =
   let peer = get (T.decode_peer S.message_limits (read_frame fd)) in
   match peer with
@@ -184,24 +248,208 @@ let source_handle request =
   reply
 
 let rec source_loop fd =
-  let request = get (T.decode_source_request S.message_limits (read_frame fd)) in
-  let reply = source_handle request in
-  write_frame fd (get (T.encode_source_reply S.message_limits reply));
+  let raw = read_frame fd in
+  (* spec §1.4：source 通道按帧内 method 字段分派；未知 method 帧级回错，进程不崩。 *)
+  let reply =
+    match frame_method raw with
+    | Some ("source_begin" | "source_chunk" | "source_finish") ->
+        let request = get (T.decode_source_request S.message_limits raw) in
+        Some (get (T.encode_source_reply S.message_limits (source_handle request)))
+    | Some ("checkpoint_blob_begin" | "checkpoint_blob_chunk" | "checkpoint_blob_finish") ->
+        (* 本 item 未接 checkpoint 上传分支：通道内 protocol_error 占位。 *)
+        (match T.decode_checkpoint_blob_request S.message_limits raw with
+         | Ok request ->
+             let header, _ = T.checkpoint_blob_request_view request in
+             Some
+               (get
+                  (T.encode_checkpoint_blob_reply S.message_limits
+                     (T.checkpoint_blob_error header T.invalid_input T.not_admitted)))
+         | Error _ ->
+             (* 解码失败：尽力从帧内投影可回显 header；拿不到则丢弃，不伪造。 *)
+             (match frame_header raw with
+              | Some header ->
+                  Some
+                    (get
+                       (T.encode_checkpoint_blob_reply S.message_limits
+                          (T.checkpoint_blob_error header T.invalid_input T.not_admitted)))
+              | None -> None))
+    | _ ->
+        (* 未知 method：帧级回错（尽力回显 header），进程不崩。 *)
+        (match frame_header raw with
+         | Some header ->
+             Some
+               (get
+                  (T.encode_source_reply S.message_limits
+                     (T.make_source_error header T.invalid_input T.not_admitted T.fact_unknown)))
+         | None -> None)
+  in
+  (match reply with
+   | Some encoded -> write_frame fd encoded
+   | None -> ());
   source_loop fd
+
+(* —— 控制通道（fd 5，spec §1.3）：ReadControl / RequestCancel —— *)
+
+(* phase 推导：执行中（pull 已标记 Executing）=Active；已有终态（terminal/aux）
+   =TerminalPhase；否则 Idle。Settling（中断待落定）在块 E 接线后补充。 *)
+let control_phase_of (op : Registry.operation) =
+  if op.terminal <> None || op.aux <> None then T.TerminalPhase
+  else
+    match op.state with
+    | Registry.Executing -> T.Active
+    | _ -> T.Idle
+
+let control_snapshot_of (op : Registry.operation) =
+  T.make_control_snapshot
+    ~operation_id:(T.op_binding_operation op.binding)
+    ~phase:(control_phase_of op)
+    ~token_generation:(uint op.cancel_generation)
+    ~highest_cancel_seq:(uint op.cancel_seq_seen)
+    ~stop_requested:op.stop_requested
+
+let control_handle request =
+  match T.control_request_view request with
+  | header, T.ReadControl operation ->
+      with_tables (fun () ->
+          match Registry.find_operation_by_id operation with
+          | Some op -> T.control_snapshot header (control_snapshot_of op)
+          | None -> T.control_unknown_operation header operation)
+  | header, T.RequestCancel (operation, cancel_seq, _) ->
+      with_tables (fun () ->
+          match Registry.find_operation_by_id operation with
+          | None -> T.control_unknown_operation header operation
+          | Some op ->
+              let seq = T.U.get cancel_seq in
+              if seq = op.cancel_seq_seen && op.last_cancel_ack <> None then
+                (* 等值：幂等重放原 ACK。 *)
+                Option.get op.last_cancel_ack
+              else if seq < op.cancel_seq_seen then
+                (* 更小：PastCancel（不存储，避免覆盖原 ACK 的重放）。 *)
+                T.control_cancel_ack header T.PastCancel (control_snapshot_of op)
+              else begin
+                op.cancel_seq_seen <- seq;
+                let status =
+                  if op.terminal <> None || op.aux <> None then T.AlreadyTerminal
+                  else begin
+                    (* 对当前执行 token 原子 set；无在途 eval 时只记 stop_requested。 *)
+                    (match op.token with Some token -> Coq.Limits.Token.set token | None -> ());
+                    op.stop_requested <- true;
+                    T.ReceivedAck
+                  end
+                in
+                let ack = T.control_cancel_ack header status (control_snapshot_of op) in
+                op.last_cancel_ack <- Some ack;
+                ack
+              end)
+
+let rec control_loop fd =
+  let request = get (T.decode_control_request S.message_limits (read_frame fd)) in
+  let reply = control_handle request in
+  write_frame fd (get (T.encode_control_reply S.message_limits reply));
+  control_loop fd
+
+(* —— view 通道（fd 7，spec §1.5）：view_pull/ack/release + blob 下载骨架 ——
+   本 item 无已登记 view/blob：一律 unknown_operation/not_admitted 回错；
+   后续 item 接 spool 服务。 *)
+let view_channel_error_encoded header (kind : [< `Pull | `Ack | `Release ]) =
+  match kind with
+  | `Pull ->
+      get
+        (T.encode_view_reply_pull S.message_limits
+           (T.make_view_pull_error header T.unknown_operation T.not_admitted))
+  | `Ack ->
+      get
+        (T.encode_view_reply_ack S.message_limits
+           (T.make_view_ack_error header T.unknown_operation T.not_admitted))
+  | `Release ->
+      get
+        (T.encode_view_reply_release S.message_limits
+           (T.make_view_release_error header T.unknown_operation T.not_admitted))
+
+let rec view_loop fd =
+  let raw = read_frame fd in
+  let reply =
+    match frame_method raw with
+    | Some (("view_pull" | "view_ack" | "view_release") as method_name) ->
+        (match T.decode_view_request S.message_limits raw with
+         | Ok request ->
+             (match T.view_request_view request with
+              | T.PullViewRequest (header, _, _, _, _, _) ->
+                  Some (view_channel_error_encoded header `Pull)
+              | T.AckViewRequest (header, _, _, _, _, _) ->
+                  Some (view_channel_error_encoded header `Ack)
+              | T.ReleaseViewRequest (header, _, _, _) ->
+                  Some (view_channel_error_encoded header `Release))
+         | Error _ ->
+             (* 解码失败：尽力回显 header 回错；拿不到则丢弃。 *)
+             (match frame_header raw with
+              | Some header ->
+                  let kind : [`Pull | `Ack | `Release ] =
+                    match method_name with
+                    | "view_pull" -> `Pull
+                    | "view_ack" -> `Ack
+                    | _ -> `Release
+                  in
+                  Some (view_channel_error_encoded header kind)
+              | None -> None))
+    | Some ("checkpoint_blob_pull" | "checkpoint_blob_ack" | "checkpoint_blob_release") ->
+        (* 本 item 未接 checkpoint 下载分支：通道内 protocol_error 占位；
+           解码失败时尽力回显 header，拿不到则丢弃该帧（不伪造 header）。 *)
+        (match T.decode_checkpoint_blob_request S.message_limits raw with
+         | Ok request ->
+             let header, _ = T.checkpoint_blob_request_view request in
+             Some
+               (get
+                  (T.encode_checkpoint_blob_reply S.message_limits
+                     (T.checkpoint_blob_error header T.unknown_operation T.not_admitted)))
+         | Error _ ->
+             (match frame_header raw with
+              | Some header ->
+                  Some
+                    (get
+                       (T.encode_checkpoint_blob_reply S.message_limits
+                          (T.checkpoint_blob_error header T.unknown_operation T.not_admitted)))
+              | None -> None))
+    | _ ->
+        (* 未知 method：尽力回错；拿不到 header 则丢弃。 *)
+        (match frame_header raw with
+         | Some header -> Some (view_channel_error_encoded header `Pull)
+         | None -> None)
+  in
+  (match reply with
+   | Some encoded -> write_frame fd encoded
+   | None -> ());
+  view_loop fd
 
 let node_id (operation : Registry.operation) step_seq =
   id (Format.asprintf "node-%s-%Ld" (T.Id.get operation.line) step_seq)
 
 let status header (op : Registry.operation) =
-  let state = match op.pending, op.terminal with
-    | Some _, _ -> T.WaitAck | _, Some _ -> T.TerminalState | _ -> T.Ready in
-  T.make_status header op.binding state (uint op.acked_through)
-    ~highest_seen:(uint !Registry.highest_seen)
-    ~retired_through:(uint !Registry.retired_through)
-    ~pending:op.pending ~terminal:op.terminal ~last_ack:op.last_ack
+  (* aux 终态（locate/fork/refresh 等）用 checkpoint_status 形状回报；普通步进操作
+     维持 make_status（pending/terminal/last_ack 逐字回放）。 *)
+  match op.aux with
+  | Some aux ->
+      T.checkpoint_status header op.binding
+        ~highest_seen:(uint !Registry.highest_seen)
+        ~retired_through:(uint !Registry.retired_through)
+        T.TerminalState (Some aux) ~stop_requested:op.stop_requested
+  | None ->
+      let state = match op.pending, op.terminal with
+        | Some _, _ -> T.WaitAck | _, Some _ -> T.TerminalState | _ -> T.Ready in
+      T.make_status header op.binding state (uint op.acked_through)
+        ~highest_seen:(uint !Registry.highest_seen)
+        ~retired_through:(uint !Registry.retired_through)
+        ~pending:op.pending ~terminal:op.terminal ~last_ack:op.last_ack
+        ~stop_requested:op.stop_requested
 
 let pull header (op : Registry.operation) =
+  (* 普通可取消 token：本 fork 的 create_atomic 是不可 set 的原子段，
+     会完全关闭控制通道取消；跨线程 set 由 bool ref 后端天然支持。
+     token 与 Executing 标记先入账本再执行。 *)
   let token = Coq.Limits.Token.create () in
+  with_tables (fun () ->
+      op.token <- Some token;
+      op.state <- Registry.Executing);
   let doc = match op.doc with
     | Some doc -> doc
     | None ->
@@ -211,6 +459,7 @@ let pull header (op : Registry.operation) =
         let raw = with_tables (fun () -> Option.get (Registry.source_bytes op.source)) in
         Shell.make_doc ~token ~uri ~raw in
   let doc, outcome = Shell.step_doc ~token ~doc ~cursor:(Int64.to_int op.cursor) in
+  with_tables (fun () -> op.state <- Registry.Ready);
   let seq = uint (Int64.succ op.acked_through) in
   let finish record = op.terminal <- Some record; T.terminal_reply header record in
   match outcome with
@@ -218,6 +467,10 @@ let pull header (op : Registry.operation) =
                       ~cursor:(uint op.cursor))
   | `Error stage -> finish (T.error_terminal op.binding seq ~parse:(stage = `Parse)
                               ~last_valid:op.parent ~group:None)
+  | `Unknown when Coq.Limits.Token.is_set token ->
+      (* 取消真实到达但本块尚未接线中断落定：按 spec 口径不发布新身份、无终态，
+         status 报 Ready 且 terminal=FUnknown（块 E 的 SettleInterrupt 接恢复）。 *)
+      status header op
   | `Unknown -> fail "nativeface: single-step outcome unknown"
   | `Step stop ->
       let node = node_id op (T.U.get seq) and next_cursor = uint (Int64.of_int stop) in
@@ -261,9 +514,15 @@ let step_reply request =
                         parent = id (Format.asprintf "root-%s" (T.Id.get line));
                         pending = None; terminal = None; aux = None; last_ack = None;
                         acked_through = 0L; line_revision = T.U.get expected_revision;
-                        doc = None }
+                        doc = None;
+                        cancel_seq_seen = 0L; cancel_generation = 1L; stop_requested = false;
+                        token = None; interrupt_snapshot = None; last_cancel_ack = None }
                     in
                     Registry.register_operation binding operation;
+                    (* 线表登记（spec §1.1）：BeginLine 建主线，frontier=root 节点。 *)
+                    Registry.register_line line
+                      ~revision:(T.U.get expected_revision)
+                      ~frontier:operation.parent ~group:None ~kind:Registry.Mainline;
                     status header operation
                 end)
   | T.PullStepRequest (header, binding, expected_step_seq) ->
@@ -358,14 +617,19 @@ let serve () =
          (read_frame (fd_of_int 3)))
   in
   let ordinary = fd_of_int 4 in
+  let control = fd_of_int 5 in
   let source = fd_of_int 6 in
+  let view = fd_of_int 7 in
   Registry.init ();
   Registry.set_input_quota (T.U.get (T.boot_input_quota boot));
   handshake boot ordinary T.Ordinary;
-  handshake boot (fd_of_int 5) T.Control;
+  handshake boot control T.Control;
   handshake boot source T.Source;
-  handshake boot (fd_of_int 7) T.View;
+  handshake boot view T.View;
+  (* spec §1.3/§1.5：控制与 view 通道各自 serve 线程，进程不因单帧错误退出。 *)
+  ignore (Thread.create control_loop control);
   ignore (Thread.create source_loop source);
+  ignore (Thread.create view_loop view);
   let rec loop () =
     let request = get (T.decode_native_request S.message_limits (read_frame ordinary)) in
     let reply = step_reply (T.native_request_view request) in
