@@ -179,6 +179,9 @@ module Registry = Pet_native_support.Pet_registry
 module Refresh = Pet_native_support.Pet_environment_refresh
 module Sync = Pet_native_support.Pet_source_sync
 module Checkpoint_dispatch = Pet_native_support.Pet_checkpoint_dispatch
+module Query_view = Pet_native_support.Pet_query_view
+module Query = Pet_native_support.Pet_query
+module Inspect = Pet_native_support.Pet_inspect
 
 let with_tables = Registry.with_tables
 
@@ -378,20 +381,31 @@ let rec view_loop fd =
          | Ok request ->
              (match T.view_request_view request with
               | T.PullViewRequest (header, view, operation, seq, offset, credit) ->
-                  (* spec §1.5：先查 Pet_source_sync 的 line_updates spool；
-                     未接管（None）再走后续模块——本 item 后 query/inspect 仍无
-                     spool，回落 unknown_operation 回错。 *)
+                  (* spec §1.5：先查 Pet_source_sync 的 line_updates spool；未接管
+                     （None）再查 Pet_query_view；都未接管 ⇒ unknown_operation。 *)
                   (match Sync.serve_view_pull header ~view ~operation ~seq
                           ~offset ~credit with
                    | Some reply ->
                        Some (get (T.encode_view_reply_pull S.message_limits reply))
-                   | None -> Some (view_channel_error_encoded header `Pull))
+                   | None ->
+                       (* spec §1.5：Sync 未接管 ⇒ 查 Pet_query_view（query 文本 /
+                          inspect facts 父子流）；仍未接管 ⇒ unknown_operation。 *)
+                       (match Query_view.serve_pull header ~view ~operation ~seq
+                                ~offset ~credit with
+                        | Some reply ->
+                            Some (get (T.encode_view_reply_pull S.message_limits reply))
+                        | None -> Some (view_channel_error_encoded header `Pull)))
               | T.AckViewRequest (header, view, operation, seq, end_offset, digest) ->
                   (match Sync.serve_view_ack header ~view ~operation ~seq
                           ~end_offset ~digest with
                    | Some reply ->
                        Some (get (T.encode_view_reply_ack S.message_limits reply))
-                   | None -> Some (view_channel_error_encoded header `Ack))
+                   | None ->
+                       (match Query_view.serve_ack header ~view ~operation ~seq
+                                ~end_offset ~digest with
+                        | Some reply ->
+                            Some (get (T.encode_view_reply_ack S.message_limits reply))
+                        | None -> Some (view_channel_error_encoded header `Ack)))
               | T.ReleaseViewRequest (header, view, operation, last_acked) ->
                   (match Sync.serve_view_release header ~view ~operation ~last_acked
                   with
@@ -399,7 +413,14 @@ let rec view_loop fd =
                        Some
                          (get
                             (T.encode_view_reply_release S.message_limits reply))
-                   | None -> Some (view_channel_error_encoded header `Release)))
+                   | None ->
+                       (match Query_view.serve_release header ~view ~operation
+                                ~last_acked with
+                        | Some reply ->
+                            Some
+                              (get
+                                 (T.encode_view_reply_release S.message_limits reply))
+                        | None -> Some (view_channel_error_encoded header `Release))))
          | Error _ ->
              (* 解码失败：尽力回显 header 回错；拿不到则丢弃。 *)
              (match frame_header raw with
@@ -1049,10 +1070,19 @@ let step_reply ~request request_view =
        | `Rejected reply -> reply
        | `Existing | `Fresh ->
            Refresh.refresh ~header ~binding ~old_env ~new_env ~publication)
-  | T.QueryRequest (header, _, _, _, _) ->
-      T.make_protocol_error header T.invalid_input T.not_admitted T.fact_unknown
-  | T.InspectRequest (header, _, _, _, _) ->
-      T.make_protocol_error header T.invalid_input T.not_admitted T.fact_unknown
+  | T.QueryRequest (header, binding, node, (source, start, stop), output_budget) ->
+      (* spec §4：路由 Pet_query（准入/节点解析/解析/白名单/执行捕获/发布在模块内，
+         模块锁→Registry 锁，路由侧不持 Registry 锁调用）。 *)
+      Query.run ~request ~header ~binding ~node ~source ~start ~stop ~output_budget
+  | T.InspectRequest (header, binding, node, selector, output_budget) ->
+      (* spec §4：Environment 消费显式可信 snapshot（M5 未接）、Notations 依赖固定
+         Rocq 纯接口——本批在准入前拒绝（不登记操作、不推进序号），不留假数据。
+         其余 selector 路由 Pet_inspect。 *)
+      (match selector with
+       | T.Environment | T.Notations ->
+           T.make_protocol_error header T.invalid_input T.not_admitted T.fact_unknown
+       | _ ->
+           Inspect.run ~request ~header ~binding ~node ~selector ~output_budget)
   | T.EndScopeRequest (header, _, _, _) ->
       T.make_protocol_error header T.invalid_input T.not_admitted T.fact_unknown
   | T.CheckpointRequest (header, view) ->
@@ -1097,6 +1127,8 @@ let serve () =
   Sync.init ~boot;
   (* item 3：boot 绑定注入 checkpoint 分发（预算/配额/epoch 核对用）。 *)
   Checkpoint_dispatch.init ~boot;
+  (* item 4：boot 绑定注入 query/inspect 视图 spool（父子共享 view 配额用）。 *)
+  Query_view.init ~boot;
   handshake boot ordinary T.Ordinary;
   handshake boot control T.Control;
   handshake boot source T.Source;

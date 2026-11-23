@@ -1,7 +1,7 @@
 (library
  (name petanque_shell)
  (public_name coq-lsp.petanque.json_shell)
- (modules :standard \ pet server pet_native pet_registry pet_environment_refresh pet_source_prefix pet_source_sync pet_checkpoint_graph pet_checkpoint_arena pet_checkpoint_dispatch)
+ (modules :standard \ pet server pet_native pet_registry pet_environment_refresh pet_source_prefix pet_source_sync pet_checkpoint_graph pet_checkpoint_arena pet_checkpoint_dispatch pet_query_check pet_query_view pet_query pet_inspect)
  (preprocess
   (staged_pps ppx_import ppx_deriving_yojson))
  (libraries petanque petanque_json))
@@ -9,7 +9,7 @@
 ;; spec §6：U3 私有模块库；modules 列表随 item 追加。petanque_shell 不加 ccv_protocol。
  (library
   (name pet_native_support)
-  (modules pet_registry pet_environment_refresh pet_source_prefix pet_source_sync pet_checkpoint_graph pet_checkpoint_arena pet_checkpoint_dispatch)
+  (modules pet_registry pet_environment_refresh pet_source_prefix pet_source_sync pet_checkpoint_graph pet_checkpoint_arena pet_checkpoint_dispatch pet_query_check pet_query_view pet_query pet_inspect)
   (libraries petanque_shell ccv_protocol threads.posix))
 
 (executable
