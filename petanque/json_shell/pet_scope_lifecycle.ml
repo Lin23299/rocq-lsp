@@ -74,7 +74,7 @@ let make_operation binding line : Registry.operation =
     pending = None; terminal = None; aux = None; last_ack = None;
     acked_through = 0L; line_revision = 0L; doc = None;
     cancel_seq_seen = 0L; cancel_generation = 1L; stop_requested = false;
-    token = None; interrupt_snapshot = None; last_cancel_ack = None }
+    token = None; interrupt_snapshot = None; terminal_receipt = None }
 
 let reject header code =
   T.make_protocol_error header code T.not_admitted T.fact_unknown
@@ -175,7 +175,6 @@ let release_registry ~(keep : Registry.operation) ops =
 let release_views operations =
   Query_view.with_lock (fun () ->
       List.iter (fun operation -> ignore (Query_view.discard_operation ~operation)) operations)
-
 let release_lines () =
   let line_keys =
     let keys = ref [] in
@@ -193,7 +192,8 @@ let release_lines () =
 
 type phase =
   [ `Rejected of T.native_reply
-  | `Closed_replay of T.terminal_record
+  | `Closed_replay of T.receipt
+  | `Status of Registry.operation
   | `Recheck of Registry.operation * scope_state ]
 
 let run ~request ~header ~binding ~scope ~expected_revision =
@@ -213,11 +213,16 @@ let run ~request ~header ~binding ~scope ~expected_revision =
     Registry.with_tables (fun () ->
         match Registry.find_operation binding with
         | Some op ->
-            (match op.terminal with
-             | Some record ->
-                 (* 已 Closed：原终态原样重放（历史回执不可变）。 *)
-                 `Closed_replay record
-             | None ->
+            (match op.terminal, op.terminal_receipt with
+             | Some _, Some receipt ->
+                 (* 已 Closed：原回执原样重放（历史回执不可变）。直答必须是
+                    receipt：Rust end_scope.rs:208 直答只认 NativeResult::Receipt
+                    （scope_receipt_phase），Terminal 落 bad_end_scope_reply 隔离。 *)
+                 `Closed_replay receipt
+             | Some _, _ ->
+                 (* 只有 record 无回执（不变量破坏）：按 status 路径报 Terminal，不伪造。 *)
+                 `Status op
+             | None, _ ->
                  let s = ensure_scope () in
                  if s.status = Closing && T.op_binding_equal binding (Stdlib.Option.value s.owner ~default:binding) then
                    `Recheck (op, s)
@@ -245,7 +250,14 @@ let run ~request ~header ~binding ~scope ~expected_revision =
   in
   match phase with
   | `Rejected reply -> reply
-  | `Closed_replay record -> T.terminal_reply header record
+  | `Closed_replay receipt -> T.receipt_reply header receipt
+  | `Status op ->
+      (* 与 pet_native.status 的终态分支同形（Terminal → Known(record)）。 *)
+      T.make_status header op.binding T.TerminalState (uint op.acked_through)
+        ~highest_seen:(uint !Registry.highest_seen)
+        ~retired_through:(uint !Registry.retired_through)
+        ~pending:op.pending ~terminal:op.terminal ~last_ack:op.last_ack
+        ~stop_requested:op.stop_requested
   | `Recheck (op, s) ->
       let ops, pending, executing = Registry.with_tables (fun () -> registry_snapshot scope) in
       let borrowed = pending + executing + material_borrows ops in
@@ -280,6 +292,9 @@ let run ~request ~header ~binding ~scope ~expected_revision =
             s.progress <- None;
             s.next_seq <- Int64.succ s.next_seq;
             op.terminal <- Some record;
+            op.terminal_receipt <- Some receipt;
             op.state <- Registry.TerminalState;
-            T.terminal_reply header record)
+            (* 直答回 receipt（Rust end_scope.rs:208）；status 仍由 op.terminal 报
+               Terminal → Known(record)（end_scope.rs:217）。 *)
+            T.receipt_reply header receipt)
       end

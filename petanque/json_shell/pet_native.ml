@@ -314,6 +314,14 @@ let control_snapshot_of (op : Registry.operation) =
     ~highest_cancel_seq:(uint op.cancel_seq_seen)
     ~stop_requested:op.stop_requested
 
+(* RequestCancel 的三元组按 types.ml control_request_view 是
+   (operation_id, token_generation, cancel_seq)：token_generation 是驱动读到的
+   快照代际（Rust interrupt.rs:90-93 用 before.token_generation 发请求），
+   cancel_seq 才是取消序号（Rust :142-151 valid_cancel_ack 核
+   Received: highest_cancel_seq == cancel_seq ∧ 代际不变 ∧ stop_requested；
+   PastCancel: highest_cancel_seq > cancel_seq；Stale: 代际已前进）。
+   幂等重放不能用存的旧 ACK 原样回——Rust channel.rs:322 核回复 header 逐字
+   等于请求 header（含 rpc_seq），重放按当前账本重算 status、用本次 header。 *)
 let control_handle request =
   match T.control_request_view request with
   | header, T.ReadControl operation ->
@@ -321,33 +329,41 @@ let control_handle request =
           match Registry.find_operation_by_id operation with
           | Some op -> T.control_snapshot header (control_snapshot_of op)
           | None -> T.control_unknown_operation header operation)
-  | header, T.RequestCancel (operation, cancel_seq, _) ->
+  | header, T.RequestCancel (operation, token_generation, cancel_seq) ->
       with_tables (fun () ->
           match Registry.find_operation_by_id operation with
           | None -> T.control_unknown_operation header operation
           | Some op ->
-              let seq = T.U.get cancel_seq in
-              if seq = op.cancel_seq_seen && op.last_cancel_ack <> None then
-                (* 等值：幂等重放原 ACK。 *)
-                Option.get op.last_cancel_ack
-              else if seq < op.cancel_seq_seen then
-                (* 更小：PastCancel（不存储，避免覆盖原 ACK 的重放）。 *)
-                T.control_cancel_ack header T.PastCancel (control_snapshot_of op)
-              else begin
-                op.cancel_seq_seen <- seq;
-                let status =
-                  if op.terminal <> None || op.aux <> None then T.AlreadyTerminal
-                  else begin
-                    (* 对当前执行 token 原子 set；无在途 eval 时只记 stop_requested。 *)
-                    (match op.token with Some token -> Coq.Limits.Token.set token | None -> ());
-                    op.stop_requested <- true;
-                    T.ReceivedAck
-                  end
-                in
-                let ack = T.control_cancel_ack header status (control_snapshot_of op) in
-                op.last_cancel_ack <- Some ack;
-                ack
-              end)
+              let seq = T.U.get cancel_seq
+              and generation = T.U.get token_generation in
+              let status =
+                if op.terminal <> None || op.aux <> None then
+                  (* 已有终态：取消无效果，只报 AlreadyTerminal（phase=terminal）。 *)
+                  T.AlreadyTerminal
+                else if generation <> op.cancel_generation then
+                  (* 请求携带的是旧代际快照（本操作已恢复、代际已 +1）⇒ Stale，
+                     不动账本；Rust 要求 after.token_generation > before。 *)
+                  T.Stale
+                else if seq <= 0L || seq < op.cancel_seq_seen then
+                  (* 非正序号或更小序号：PastCancel、不动账本（Rust 对
+                     highest_cancel_seq > seq 不成立的 PastCancel 判失配）。 *)
+                  T.PastCancel
+                else if seq = op.cancel_seq_seen then
+                  (* 等值重放：该取消已受理且仍有效（stop_requested 只在恢复
+                     成功时清零，而恢复必使代际 +1，已在上一分支报 Stale）。 *)
+                  T.ReceivedAck
+                else begin
+                  (* 新取消：记序号；对当前执行 token 原子 set；无在途 eval 时
+                     只记 stop_requested。 *)
+                  op.cancel_seq_seen <- seq;
+                  (match op.token with
+                   | Some token -> Coq.Limits.Token.set token
+                   | None -> ());
+                  op.stop_requested <- true;
+                  T.ReceivedAck
+                end
+              in
+              T.control_cancel_ack header status (control_snapshot_of op))
 
 let rec control_loop fd =
   let request = get (T.decode_control_request S.message_limits (read_frame fd)) in
@@ -618,7 +634,7 @@ let make_aux_operation binding line_id : Registry.operation =
     pending = None; terminal = None; aux = None; last_ack = None;
     acked_through = 0L; line_revision = 0L; doc = None;
     cancel_seq_seen = 0L; cancel_generation = 1L; stop_requested = false;
-    token = None; interrupt_snapshot = None; last_cancel_ack = None }
+    token = None; interrupt_snapshot = None; terminal_receipt = None }
 
 (* 新操作准入（spec §1 预算准入）：序号 = highest_seen+1、未退役、
    预算已登记且 entry_uses_budget 与原请求全匹配。 *)
@@ -718,7 +734,7 @@ let step_reply ~request request_view =
                         acked_through = 0L; line_revision = T.U.get expected_revision;
                         doc = None;
                         cancel_seq_seen = 0L; cancel_generation = 1L; stop_requested = false;
-                        token = None; interrupt_snapshot = None; last_cancel_ack = None }
+                        token = None; interrupt_snapshot = None; terminal_receipt = None }
                     in
                     Registry.register_operation binding operation;
                     (* 线表登记（spec §1.1）：BeginLine 建主线，frontier=root 节点。 *)
@@ -952,9 +968,18 @@ let step_reply ~request request_view =
         T.select_fields args in
       with_tables (fun () ->
           match Registry.find_operation binding with
-          | Some { terminal = Some record; _ } ->
-              (* 幂等：同 binding 重入重放原终态。 *)
-              T.terminal_reply header record
+          | Some { terminal = Some record; terminal_receipt = Some receipt; _ } ->
+              (* 幂等：同 binding 重入重放原回执。直答必须是 receipt（Rust
+                 spawn.rs:962 entry 路径、state_operations.rs:996 grouped 路径
+                 只认 NativeResult::Receipt）。 *)
+              T.receipt_reply header receipt
+          | Some ({ terminal = Some _; _ } as op) ->
+              (* 只有 record 无回执（不变量破坏）：按 status 报 Terminal，不伪造。 *)
+              T.make_status header op.binding T.TerminalState (uint op.acked_through)
+                ~highest_seen:(uint !Registry.highest_seen)
+                ~retired_through:(uint !Registry.retired_through)
+                ~pending:op.pending ~terminal:op.terminal ~last_ack:op.last_ack
+                ~stop_requested:op.stop_requested
           | Some op -> status header op
           | None ->
               let reject code = T.make_protocol_error header code T.not_admitted T.fact_unknown in
@@ -969,33 +994,32 @@ let step_reply ~request request_view =
                         if T.Id.get line.frontier <> T.Id.get candidate then
                           reject T.invalid_input
                         else begin
-                          let after_rev = Int64.succ line.revision in
-                          line.revision <- after_rev;
-                          let record =
-                            match T.select_group args with
-                            | Some (group_id, group_rev_expected) ->
-                                let group_rev = Int64.succ (T.U.get group_rev_expected) in
-                                line.group <- Some (group_id, group_rev);
-                                let _receipt, record =
-                                  T.make_selected_group binding ~line:destination
-                                    ~before_revision:expected_revision
-                                    ~after_revision:(uint after_rev) ~node:candidate
-                                    ~group:group_id ~group_revision:(uint group_rev) in
-                                record
-                            | None ->
-                                let _receipt, record =
-                                  T.make_selected_entry binding ~line:destination
-                                    ~before_revision:expected_revision
-                                    ~after_revision:(uint after_rev) ~node:candidate in
-                                record
-                          in
-                          let operation = make_aux_operation binding destination in
-                          operation.terminal <- Some record;
-                          operation.line_revision <- after_rev;
-                          operation.parent <- candidate;
-                          Registry.highest_seen := T.U.get (T.op_seq binding);
-                          Registry.register_operation binding operation;
-                          T.terminal_reply header record
+                           let after_rev = Int64.succ line.revision in
+                           line.revision <- after_rev;
+                           let receipt, record =
+                             match T.select_group args with
+                             | Some (group_id, group_rev_expected) ->
+                                 let group_rev = Int64.succ (T.U.get group_rev_expected) in
+                                 line.group <- Some (group_id, group_rev);
+                                 T.make_selected_group binding ~line:destination
+                                   ~before_revision:expected_revision
+                                   ~after_revision:(uint after_rev) ~node:candidate
+                                   ~group:group_id ~group_revision:(uint group_rev)
+                             | None ->
+                                 T.make_selected_entry binding ~line:destination
+                                   ~before_revision:expected_revision
+                                   ~after_revision:(uint after_rev) ~node:candidate
+                           in
+                           let operation = make_aux_operation binding destination in
+                           operation.terminal <- Some record;
+                           (* 直答回 receipt（Rust 直答只认 Receipt）；status 由
+                              op.terminal 报 Terminal → Known(record)。 *)
+                           operation.terminal_receipt <- Some receipt;
+                           operation.line_revision <- after_rev;
+                           operation.parent <- candidate;
+                           Registry.highest_seen := T.U.get (T.op_seq binding);
+                           Registry.register_operation binding operation;
+                           T.receipt_reply header receipt
                         end)))
   | T.ForkLineRequest (header, args) ->
       (* spec §1.1：父线存在且版本/前沿可核 ⇒ 新探索线（frontier=父前沿）。 *)

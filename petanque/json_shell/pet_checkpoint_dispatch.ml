@@ -278,7 +278,7 @@ let make_aux_operation binding =
     pending = None; terminal = None; aux = None; last_ack = None;
     acked_through = 0L; line_revision = 0L; doc = None;
     cancel_seq_seen = 0L; cancel_generation = 1L; stop_requested = false;
-    token = None; interrupt_snapshot = None; last_cancel_ack = None }
+    token = None; interrupt_snapshot = None; terminal_receipt = None }
 
 (* 预算准入（须在 with_tables 内调用；与 pet_native.admit_new 同款 +
    checkpoint 专属预算核对）。 *)

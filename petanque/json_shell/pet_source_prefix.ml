@@ -18,8 +18,12 @@ type retain_result = {
   changed : bool;          (* new==old ⇒ false *)
 }
 
-(* 字节 LCP：先求逐字节公共前缀长度，再回退到 UTF-8 字符边界
-   （字节 0 总是边界；落在连续字节 10xxxxxx 上则继续回退）。 *)
+(* 字节 LCP：先求逐字节公共前缀长度，再回退到 UTF-8 字符边界。
+   回退看的是 index 处的字节是否为连续字节（10xxxxxx）。index = limit 时两串中
+   较短者已到末尾：不得对它取字节（追加编辑——old 是 new 前缀——时 limit 恰为
+   old 长度，取 old.[limit] 越界崩溃，进程退出）；改看较长串在 index 处的字节
+   （[0, limit) 内两串逐字节相同），仍是连续字节说明较短串末尾落在多字节字符
+   中间，继续回退；两串同长则 index 即末尾边界。 *)
 let lcp ~old ~new_ =
   let limit = min (String.length old) (String.length new_) in
   let rec common index =
@@ -27,11 +31,18 @@ let lcp ~old ~new_ =
     else if old.[index] = new_.[index] then common (index + 1)
     else index
   in
+  let byte_at index =
+    if index < String.length old then Some old.[index]
+    else if index < String.length new_ then Some new_.[index]
+    else None
+  in
   let rec boundary index =
     if index <= 0 then 0
-    else if (Char.code old.[index] land 0xc0) = 0x80 then
-      boundary (index - 1)
-    else index
+    else
+      match byte_at index with
+      | None -> index
+      | Some c when (Char.code c land 0xc0) = 0x80 -> boundary (index - 1)
+      | Some _ -> index
   in
   boundary (common 0)
 

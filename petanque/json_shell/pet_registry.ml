@@ -40,7 +40,10 @@ type operation = {
   mutable stop_requested : bool;
   mutable token : Coq.Limits.Token.t option; (* 当前/最近一次执行的 token（原子） *)
   mutable interrupt_snapshot : Fleche.Doc.t option; (* 中断父快照，SettleInterrupt 用 *)
-  mutable last_cancel_ack : T.control_reply option;  (* 等值取消幂等重放原 ACK *)
+  (* Closed/Selected 的直答回执：terminal_record 在协议里抽象、取不回 receipt，
+     而 Rust 直答只认 NativeResult::Receipt（status 仍报 Terminal→Known(record)）。
+     两处同一次构造（make_ended_closed / make_selected_*），重入原样重放。 *)
+  mutable terminal_receipt : T.receipt option;
 }
 
 (* 线注册表（spec §1.1）：BeginLine 建主线，fork 建探索线，select 迁移 frontier。 *)
