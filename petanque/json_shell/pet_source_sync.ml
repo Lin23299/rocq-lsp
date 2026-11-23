@@ -47,6 +47,21 @@ let boot_ref : T.native_boot_binding option ref = ref None
 let contexts : (string, context_state) Hashtbl.t = Hashtbl.create 7
 let spools : (string, spool) Hashtbl.t = Hashtbl.create 7
 
+(* 该操作名下未 release 的 line_updates spool 数（item 5 EndScope 借用枚举用；
+   本模块锁内）。 *)
+let unreleased_views ~operation =
+  Mutex.lock lock;
+  Fun.protect
+    ~finally:(fun () -> Mutex.unlock lock)
+    (fun () ->
+       let count = ref 0 in
+       Hashtbl.iter
+         (fun _ (s : spool) ->
+            if not s.released && T.Id.get s.operation = T.Id.get operation then
+              incr count)
+         spools;
+       !count)
+
 let uri_counter = ref 0
 
 let init ~boot =

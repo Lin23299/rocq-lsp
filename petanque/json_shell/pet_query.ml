@@ -21,6 +21,7 @@ module Registry = Pet_registry
 module Shell = Petanque_shell.Shell
 module Check = Pet_query_check
 module View = Pet_query_view
+module Scope = Pet_scope_lifecycle
 
 let get = function Ok value -> value | Error _ -> invalid_arg "pet_query"
 let uint value = get (T.U.make value)
@@ -161,6 +162,7 @@ let admit header binding (request : T.native_request) =
       if seq <= !Registry.retired_through then
         `Rejected
           (T.make_past_unavailable header (T.op_seq binding) (uint !Registry.highest_seen))
+      else if not (Scope.admits ~binding) then `Rejected (reject T.invalid_state)
       else if seq <> Int64.succ !Registry.highest_seen then `Rejected (reject T.SequenceGap)
       else
         match Registry.find_budget (T.op_binding_budget binding) with

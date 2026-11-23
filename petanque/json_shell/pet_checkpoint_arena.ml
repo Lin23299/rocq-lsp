@@ -79,6 +79,15 @@ let init () =
       Hashtbl.reset downloads;
       Hashtbl.reset imports)
 
+(* 该操作名下未 release 的下载 spool 数（item 5 EndScope 借用枚举用；本模块锁内）。 *)
+let unreleased_downloads ~operation =
+  let count = ref 0 in
+  Hashtbl.iter
+    (fun _ (d : download_state) ->
+       if not d.released && T.Id.get d.operation = T.Id.get operation then incr count)
+    downloads;
+  !count
+
 (* artifact 身份比对（kind/digest/bytes；id 由表键钉住，不再比较）。 *)
 let artifact_same (a : T.artifact_ref) (b : T.artifact_ref) =
   a.artifact_kind = b.artifact_kind

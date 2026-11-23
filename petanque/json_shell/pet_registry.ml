@@ -90,6 +90,14 @@ let register_operation binding operation =
 
 let iter_operations f = List.iter (fun (_, operation) -> f operation) !operations
 
+(* 真实删除（item 5：scope Closed 时删除该 scope 名下的操作/线；调用方负责先排空
+   借用并保共享 context 的他人引用）。须在 with_tables 内调用。 *)
+let remove_operation binding =
+  operations :=
+    List.filter (fun (known, _) -> not (T.op_binding_equal known binding)) !operations
+
+let remove_line line_id = Hashtbl.remove lines (T.Id.get line_id)
+
 (* 控制通道按操作 id 查找（ReadControl/RequestCancel 只带 id）。 *)
 let find_operation_by_id operation_id =
   List.find_opt

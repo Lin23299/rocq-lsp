@@ -182,6 +182,7 @@ module Checkpoint_dispatch = Pet_native_support.Pet_checkpoint_dispatch
 module Query_view = Pet_native_support.Pet_query_view
 module Query = Pet_native_support.Pet_query
 module Inspect = Pet_native_support.Pet_inspect
+module Scope = Pet_native_support.Pet_scope_lifecycle
 
 let with_tables = Registry.with_tables
 
@@ -472,6 +473,14 @@ let node_id (operation : Registry.operation) step_seq =
 let status header (op : Registry.operation) =
   (* aux 终态（locate/fork/refresh 等）用 checkpoint_status 形状回报；普通步进操作
      维持 make_status（pending/terminal/last_ack 逐字回放）。 *)
+  if Scope.is_closing_owner ~binding:op.binding then
+    (* item 5：Closing 中的 end-scope 操作报 Retiring（Rust end_scope_status 只接受
+       (Retiring, N/A) / (Terminal, Closed 回执)）；Closed 后走 terminal 分支。 *)
+    T.make_retiring_status header op.binding
+      ~highest_seen:(uint !Registry.highest_seen)
+      ~retired_through:(uint !Registry.retired_through)
+      ~stop_requested:op.stop_requested
+  else
   match op.aux with
   | Some aux ->
       T.checkpoint_status header op.binding
@@ -619,6 +628,9 @@ let admit_new header binding request =
   if seq <= !Registry.retired_through then
     `Rejected
       (T.make_past_unavailable header (T.op_seq binding) (uint !Registry.highest_seen))
+  else if not (Scope.admits ~binding) then
+    (* item 5：scope 进入 Closing/Closed 后封新准入（spec §5 步骤 3）。 *)
+    `Rejected (reject T.invalid_state)
   else if seq <> Int64.succ !Registry.highest_seen then
     `Rejected (reject T.SequenceGap)
   else
@@ -685,6 +697,9 @@ let step_reply ~request request_view =
                 (* 已 retire 的序号：按 spec §1 返回 past_unavailable。 *)
                 T.make_past_unavailable header (T.op_seq binding)
                   (uint !Registry.highest_seen)
+            | None when not (Scope.admits ~binding) ->
+                (* item 5：Closing/Closed 的 scope 拒新线（封新准入）。 *)
+                T.make_protocol_error header T.invalid_state T.not_admitted T.fact_unknown
             | None ->
                 Registry.highest_seen := T.U.get (T.op_seq binding);
                 begin match Registry.source_bytes script_source with
@@ -722,6 +737,11 @@ let step_reply ~request request_view =
           else match op.pending, op.terminal with
             | Some r, _ -> T.receipt_reply header r
             | _, Some t -> T.terminal_reply header t
+            | _ when not (Scope.admits ~binding:op.binding) ->
+                (* item 5：Closing/Closed 的 scope 不再执行新步（ACK/finish/release
+                   仍可沿原 owner 处理）。 *)
+                T.make_protocol_error header T.invalid_state T.not_admitted
+                  T.fact_unknown
             | _ -> pull header op
       end
   | T.AckStepRequest (header, binding, proof) ->
@@ -1083,8 +1103,10 @@ let step_reply ~request request_view =
            T.make_protocol_error header T.invalid_input T.not_admitted T.fact_unknown
        | _ ->
            Inspect.run ~request ~header ~binding ~node ~selector ~output_budget)
-  | T.EndScopeRequest (header, _, _, _) ->
-      T.make_protocol_error header T.invalid_input T.not_admitted T.fact_unknown
+  | T.EndScopeRequest (header, binding, scope, expected_revision) ->
+      (* item 5（N05）：路由 Pet_scope_lifecycle（准入/借用枚举/Closing-Closed/真实
+         删除在模块内，Registry 锁内串行）。 *)
+      Scope.run ~request ~header ~binding ~scope ~expected_revision
   | T.CheckpointRequest (header, view) ->
       (* NC04/NC06/NC08：路由 Pet_checkpoint_dispatch（admit + make_aux_operation
          在 dispatch 内，line 记 binding.context）。 *)
@@ -1129,6 +1151,8 @@ let serve () =
   Checkpoint_dispatch.init ~boot;
   (* item 4：boot 绑定注入 query/inspect 视图 spool（父子共享 view 配额用）。 *)
   Query_view.init ~boot;
+  (* item 5：scope 生命周期状态清零。 *)
+  Scope.init ();
   handshake boot ordinary T.Ordinary;
   handshake boot control T.Control;
   handshake boot source T.Source;
