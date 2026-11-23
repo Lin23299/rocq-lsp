@@ -490,6 +490,16 @@ let create ~token ~env ~uri ~languageId ~version ~raw =
   handle_contents_creation ~env ~uri ~version ~languageId ~raw
     (handle_doc_creation_exec ~token)
 
+(* CCV：以调用方给定的真实已执行节点 state 为 root 的新文档（同线续接 / fork 探索线
+    从父线前沿节点续算）。不经 mk_doc（不重跑 workspace 初始化：root 的谱系已含），
+    无 init 反馈节点；completed=Stopped(init) 使 check 从首句起算。 *)
+let create_at_state ~env ~uri ~languageId ~version ~raw ~root =
+  handle_contents_creation ~env ~uri ~version ~languageId ~raw
+    (fun ~env ~uri ~languageId ~version ~contents ->
+       let completed range = Completion.Stopped range in
+       empty_doc ~uri ~languageId ~contents ~version ~env ~root ~nodes:[]
+         ~completed)
+
 let create ~token ~env ~uri ~languageId ~version ~raw =
   NewProfile.profile "Doc.create"
     (fun () -> create ~token ~env ~uri ~languageId ~version ~raw)

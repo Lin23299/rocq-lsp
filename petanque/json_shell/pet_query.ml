@@ -149,7 +149,8 @@ let make_aux_operation binding line : Registry.operation =
     pending = None; terminal = None; aux = None; last_ack = None;
     acked_through = 0L; line_revision = 0L; doc = None;
     cancel_seq_seen = 0L; cancel_generation = 1L; stop_requested = false;
-    token = None; interrupt_snapshot = None; terminal_receipt = None }
+    token = None; interrupt_snapshot = None; terminal_receipt = None;
+    root_state = None }
 
 (* 新操作准入（spec §1 预算准入）：序号 = highest_seen+1、未退役、预算已登记且
    entry_uses_budget 与原请求全匹配。已存在 ⇒ `Existing（幂等/续跑由调用方判）。 *)

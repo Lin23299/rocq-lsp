@@ -44,6 +44,10 @@ type operation = {
      而 Rust 直答只认 NativeResult::Receipt（status 仍报 Terminal→Known(record)）。
      两处同一次构造（make_ended_closed / make_selected_*），重入原样重放。 *)
   mutable terminal_receipt : T.receipt option;
+  (* 本操作执行栈的起点状态：新线（前沿为 root）⇒ None（doc 从 workspace init
+     起算）；同线续接 / fork 探索线 ⇒ 线前沿节点的真实 state（BeginLine 时从线表
+     取定；pull 建 doc 时以此为 root，新脚本 cursor 从 0 开始）。 *)
+  mutable root_state : Coq.State.t option;
 }
 
 (* 线注册表（spec §1.1）：BeginLine 建主线，fork 建探索线，select 迁移 frontier。 *)
@@ -52,6 +56,10 @@ type line_kind = Mainline | Exploration
 type line_state = {
   mutable revision : int64;
   mutable frontier : T.Id.t;
+  (* 前沿节点的真实 state（每个成功步进后同步；fork 时子线继承父线）。None ⇒
+     前沿是 root（从未成功步进）。续接 / fork 的新操作以此为执行栈起点，使
+     「parent = 前沿节点」的回执与实际执行起点一致。 *)
+  mutable frontier_state : Coq.State.t option;
   mutable group : (T.Id.t * int64) option;
   kind : line_kind;
 }
@@ -110,8 +118,9 @@ let find_operation_by_id operation_id =
   |> Option.map snd
 
 (* 线表（须在 with_tables 内调用）。 *)
-let register_line line_id ~revision ~frontier ~group ~kind =
-  Hashtbl.replace lines (T.Id.get line_id) { revision; frontier; group; kind }
+let register_line line_id ~revision ~frontier ~frontier_state ~group ~kind =
+  Hashtbl.replace lines (T.Id.get line_id)
+    { revision; frontier; frontier_state; group; kind }
 
 let find_line line_id = Hashtbl.find_opt lines (T.Id.get line_id)
 

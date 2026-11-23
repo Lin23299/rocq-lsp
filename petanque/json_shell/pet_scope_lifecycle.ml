@@ -74,7 +74,8 @@ let make_operation binding line : Registry.operation =
     pending = None; terminal = None; aux = None; last_ack = None;
     acked_through = 0L; line_revision = 0L; doc = None;
     cancel_seq_seen = 0L; cancel_generation = 1L; stop_requested = false;
-    token = None; interrupt_snapshot = None; terminal_receipt = None }
+    token = None; interrupt_snapshot = None; terminal_receipt = None;
+    root_state = None }
 
 let reject header code =
   T.make_protocol_error header code T.not_admitted T.fact_unknown

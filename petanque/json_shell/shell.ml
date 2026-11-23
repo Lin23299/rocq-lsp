@@ -149,11 +149,18 @@ let make_doc ~token ~uri ~raw =
   Fleche.Doc.create ~token ~env:(Option.get !env) ~uri ~languageId
     ~version:0 ~raw
 
+(* 以给定真实节点 state 为执行起点的文档（同线续接 / fork 探索线）：不重跑
+    workspace 初始化，首句从 root 起算，字节偏移对新脚本从 0 起。 *)
+let make_doc_at ~uri ~raw ~root =
+  Fleche.Doc.create_at_state ~env:(Option.get !env) ~uri ~languageId
+    ~version:0 ~raw ~root
+
 (* 如同 until_theorem，只把目标推进一个位置，解析恢复节点也会停，不越过坏句。
    中断（spec §1.2）：Coq.Protect.R.Interrupted / Sys.Break 真实发生时 Fleche 把
    完成态落成 Stopped——判据 = check 后 token 已被 set 且无新执行节点/错误诊断。
    stage 区分：解析中断走 EOF 分支会留下一个 ast=None、无诊断、区间不越过
-   cursor 的空节点 ⇒ `Parse；无法区分时归 `Execute（保守面：两侧恢复路径相同）。 *)
+   cursor 的空节点 ⇒ `Parse；无法区分时归 `Execute（保守面：两侧恢复路径相同）。
+   `Step 带所执行节点的真实 state（步后前沿状态；续接 / fork 以此为执行起点）。 *)
 let step_doc ~token ~(doc : Fleche.Doc.t) ~cursor =
   let p = last_point doc in
   let target = Fleche.Doc.Target.Position (p.line, p.character + 1) in
@@ -165,14 +172,15 @@ let step_doc ~token ~(doc : Fleche.Doc.t) ~cursor =
     match List.rev doc.nodes with
     | last :: _ when Stdlib.Option.is_none (Fleche.Doc.Node.ast last)
                     && not (List.exists Lang.Diagnostic.is_error (Fleche.Doc.Node.diags last))
-                    && last.range.end_.offset <= cursor -> `Parse
+                     && last.range.end_.offset <= cursor -> `Parse
     | _ -> `Execute
   in
   let outcome = match node, doc.completed with
     | Some n, _ when List.exists Lang.Diagnostic.is_error n.diags ->
         `Error (if Stdlib.Option.is_none n.ast then `Parse else `Execute)
     | _, Failed _ | _, WorkspaceUpdated _ -> `Unknown
-    | Some n, _ when Stdlib.Option.is_some n.ast -> `Step n.range.end_.offset
+    | Some n, _ when Stdlib.Option.is_some n.ast ->
+        `Step (n.range.end_.offset, Fleche.Doc.Node.state n)
     | None, Yes _ -> `Eof
     | None, Stopped _ when Coq.Limits.Token.is_set token -> `Interrupted (interrupted_stage ())
     | _ -> `Unknown in

@@ -132,6 +132,20 @@ val create :
   -> raw:string
   -> t
 
+(** [create_at_state ~env ~uri ~languageId ~version ~raw ~root] creates a fresh
+    document whose execution starts from [root], a state that must come from a
+    real executed node (same-line continuation / forked exploration line). It
+    does not re-run workspace initialization; the first sentence executes from
+    [root] and byte offsets restart at 0 for [raw]. *)
+val create_at_state :
+     env:Env.t
+  -> uri:Lang.LUri.File.t
+  -> languageId:string
+  -> version:int
+  -> raw:string
+  -> root:Coq.State.t
+  -> t
+
 (** Update the contents of a document, updating the right structures for
     incremental checking. If the operation fails, the document will be left in
     `Failed` state. *)

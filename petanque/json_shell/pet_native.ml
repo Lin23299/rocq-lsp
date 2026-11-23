@@ -567,6 +567,18 @@ let settle_interrupted_reply header (op : Registry.operation) snapshot =
         end
   end
 
+(* 线组版本推进（须在 Registry 锁内）：ACK 与 Parse/Execute 错误终态各结束一个组
+   事务——探索线组版本 +1 并返回推进后的组快照；主线无组 ⇒ None。Rust
+   spawn.rs:2066 advanced_group 要求同组 id 且 expected_revision 严格递增，
+   state_operations.rs:549 要求候选 ACK 的 group = Known。 *)
+let advance_line_group (op : Registry.operation) : (T.Id.t * T.U.t) option =
+  match Registry.find_line op.line with
+  | Some ({ group = Some (group_id, rev); _ } as line_state) ->
+      let next = Int64.succ rev in
+      line_state.group <- Some (group_id, next);
+      Some (group_id, uint next)
+  | _ -> None
+
 let pull header (op : Registry.operation) =
   (* 普通可取消 token：本 fork 的 create_atomic 是不可 set 的原子段，
      会完全关闭控制通道取消；跨线程 set 由 bool ref 后端天然支持。
@@ -581,8 +593,15 @@ let pull header (op : Registry.operation) =
         incr uri_counter;
         let uri = Lang.LUri.of_string (Format.asprintf "file:///tmp/ccv_native_%d_%d.v"
             (Unix.getpid ()) !uri_counter) |> Lang.LUri.File.of_uri |> get in
-        let raw = with_tables (fun () -> Option.get (Registry.source_bytes op.source)) in
-        Shell.make_doc ~token ~uri ~raw in
+        let raw, root =
+          with_tables (fun () ->
+              (Option.get (Registry.source_bytes op.source), op.root_state)) in
+        (* 续接 / fork 线：从前沿节点的真实 state 起算（parent = 前沿节点的回执与
+           实际执行起点一致）；新线从 workspace init 起算。 *)
+        (match root with
+         | None -> Shell.make_doc ~token ~uri ~raw
+         | Some root -> Shell.make_doc_at ~uri ~raw ~root)
+  in
   (* 步前快照（spec §1.2）：中断真实发生时作为恢复父快照。 *)
   let snapshot = Shell.snapshot_doc doc in
   let doc, outcome = Shell.step_doc ~token ~doc ~cursor:(Int64.to_int op.cursor) in
@@ -594,9 +613,14 @@ let pull header (op : Registry.operation) =
   let finish record = op.terminal <- Some record; T.terminal_reply header record in
   match outcome with
   | `Eof -> finish (T.make_eof op.binding seq ~acked_through:(uint op.acked_through)
-                      ~cursor:(uint op.cursor))
-  | `Error stage -> finish (T.error_terminal op.binding seq ~parse:(stage = `Parse)
-                              ~last_valid:op.parent ~group:None)
+                       ~cursor:(uint op.cursor))
+  | `Error stage ->
+      (* 错误终态结束一个组事务：探索线带推进后的组快照（Rust
+         validate_terminal_receipt 对 Parse/Execute 错误核 advanced_group）；主线
+         无组 ⇒ None。 *)
+      let group = with_tables (fun () -> advance_line_group op) in
+      finish (T.error_terminal op.binding seq ~parse:(stage = `Parse)
+                ~last_valid:op.parent ~group)
   | `Interrupted _stage ->
       (* 中断真实发生（spec §1.2）：先入父快照账本，再尝试原恢复期限内联落定；
          驱动端 pull 只接受 Receipt/Terminal/PastUnavailable，可恢复的中断必须
@@ -605,25 +629,24 @@ let pull header (op : Registry.operation) =
       with_tables (fun () -> op.interrupt_snapshot <- Some snapshot);
       with_tables (fun () -> settle_interrupted_reply header op snapshot)
   | `Unknown -> fail "nativeface: single-step outcome unknown"
-  | `Step stop ->
+  | `Step (stop, state) ->
       let node = node_id op (T.U.get seq) and next_cursor = uint (Int64.of_int stop) in
       let r = T.make_step_receipt op.binding ~parent:op.parent ~node ~source:op.source
           ~command_start:(uint op.cursor) ~command_end:next_cursor ~next_cursor ~line:op.line
           ~base_revision:(uint op.line_revision) ~step_seq:seq in
-      op.doc <- Some doc; op.parent <- node; op.cursor <- T.U.get next_cursor;
-      op.pending <- Some r;
-      (* 线表同步（spec §1.1）：成功步进后 frontier 推进到新节点。 *)
+      (* 线表同步（spec §1.1）：成功步进后 frontier 推进到新节点，前沿 state =
+         所执行节点的真实 state（续接 / fork 的执行起点）。 *)
       with_tables (fun () ->
+          op.doc <- Some doc; op.parent <- node; op.cursor <- T.U.get next_cursor;
+          op.pending <- Some r;
           match Registry.find_line op.line with
-          | Some line_state -> line_state.frontier <- node
+          | Some line_state ->
+              line_state.frontier <- node;
+              line_state.frontier_state <- Some state
           | None -> ());
       T.receipt_reply header r
 
 (* —— 内联 locate/fork/select 辅助（spec §1.1）—— *)
-
-(* 账本节点 id：与 pull 的 node_id 同一方案（第 i 个 Fleche 节点 = 步序 i+1）。 *)
-let ledger_node line_key index =
-  id (Format.asprintf "node-%s-%d" line_key (index + 1))
 
 let line_root line_key = id (Format.asprintf "root-%s" line_key)
 
@@ -634,7 +657,8 @@ let make_aux_operation binding line_id : Registry.operation =
     pending = None; terminal = None; aux = None; last_ack = None;
     acked_through = 0L; line_revision = 0L; doc = None;
     cancel_seq_seen = 0L; cancel_generation = 1L; stop_requested = false;
-    token = None; interrupt_snapshot = None; terminal_receipt = None }
+    token = None; interrupt_snapshot = None; terminal_receipt = None;
+    root_state = None }
 
 (* 新操作准入（spec §1 预算准入）：序号 = highest_seen+1、未退役、
    预算已登记且 entry_uses_budget 与原请求全匹配。 *)
@@ -670,7 +694,8 @@ let locate_context_line () =
           if !op_ref = None && T.Id.get op.line = line_key then op_ref := Some op);
       Option.map (fun op -> (line_key, line_state, op)) !op_ref
 
-(* doc 内定位覆盖某 UTF-16 位置且已真实执行的节点。 *)
+(* doc 内定位覆盖某 UTF-16 位置且已真实执行的节点（只判「已执行到目标位置」，
+   不再借用目标节点的区间——定位边界的入口恒为当前前沿）。 *)
 let range_covers (r : Lang.Range.t) line character =
   let after_start =
     r.start.line < line || (r.start.line = line && r.start.character <= character) in
@@ -679,22 +704,11 @@ let range_covers (r : Lang.Range.t) line character =
   after_start && before_end
 
 let covering_node (doc : Fleche.Doc.t) line character =
-  let rec go index = function
-    | [] -> None
-    | node :: rest ->
-        if Fleche.Doc.Node.ast node <> None
-           && range_covers (Fleche.Doc.Node.range node) line character
-        then Some (index, node)
-        else go (index + 1) rest
-  in
-  go 0 doc.Fleche.Doc.nodes
-
-let node_index (doc : Fleche.Doc.t) (target : Fleche.Doc.Node.t) =
-  let rec go index = function
-    | [] -> None
-    | node :: rest -> if node == target then Some index else go (index + 1) rest
-  in
-  go 0 doc.Fleche.Doc.nodes
+  List.exists
+    (fun node ->
+       Fleche.Doc.Node.ast node <> None
+       && range_covers (Fleche.Doc.Node.range node) line character)
+    doc.Fleche.Doc.nodes
 
 let step_reply ~request request_view =
   match request_view with
@@ -718,31 +732,75 @@ let step_reply ~request request_view =
                 T.make_protocol_error header T.invalid_state T.not_admitted T.fact_unknown
             | None ->
                 Registry.highest_seen := T.U.get (T.op_seq binding);
-                begin match Registry.source_bytes script_source with
-                | _ when T.U.get expected_revision <> 0L ->
-                    T.make_protocol_error header T.StaleRevision T.not_admitted T.fact_unknown
-                | None ->
-                    T.make_protocol_error header T.invalid_input T.not_admitted T.fact_unknown
+                let reject code =
+                  T.make_protocol_error header code T.not_admitted T.fact_unknown
+                in
+                let expected = T.U.get expected_revision in
+                match Registry.source_bytes script_source with
+                | None -> reject T.invalid_input
                 | Some _ when Registry.find_budget (T.op_binding_budget binding) = None ->
-                    T.make_protocol_error header T.invalid_input T.not_admitted T.fact_unknown
+                    reject T.invalid_input
                 | Some _ ->
-                    let operation : Registry.operation =
-                      { binding; state = Registry.Ready; line; source = script_source; expected_revision;
-                        cursor = 0L;
-                        parent = id (Format.asprintf "root-%s" (T.Id.get line));
-                        pending = None; terminal = None; aux = None; last_ack = None;
-                        acked_through = 0L; line_revision = T.U.get expected_revision;
-                        doc = None;
-                        cancel_seq_seen = 0L; cancel_generation = 1L; stop_requested = false;
-                        token = None; interrupt_snapshot = None; terminal_receipt = None }
+                    (* 线准入：新线须 expected_revision = 0；已有线（同线续接、fork 出
+                       的探索线）须 expected_revision = 线当前版本，且线上没有未到终态
+                       的步进操作。Rust 同线续接以 ACK 后的线版本发 BeginLine
+                       （native_pet_probe.rs continue_line），候选 BeginLine 带 fork 的
+                       revision（state_operations.rs:212）；旧实现一律要求 0 ⇒ 父线
+                       ACK 过一步即 StaleRevision。 *)
+                    let admission =
+                      match Registry.find_line line with
+                      | None when expected <> 0L -> `Stale
+                      | None -> `New
+                      | Some line_state when line_state.revision <> expected -> `Stale
+                      | Some line_state ->
+                          let active = ref false in
+                          Registry.iter_operations (fun op ->
+                              if (not !active) && op.line = line && op.aux = None
+                                 && op.terminal = None then active := true);
+                          if !active then `Conflict else `Continue line_state
                     in
-                    Registry.register_operation binding operation;
-                    (* 线表登记（spec §1.1）：BeginLine 建主线，frontier=root 节点。 *)
-                    Registry.register_line line
-                      ~revision:(T.U.get expected_revision)
-                      ~frontier:operation.parent ~group:None ~kind:Registry.Mainline;
-                    status header operation
-                end)
+                    match admission with
+                    | `Stale -> reject T.StaleRevision
+                    | `Conflict ->
+                        T.make_protocol_error header T.BindingConflict
+                          T.ExistingOperation T.fact_unknown
+                    | `New ->
+                        let operation : Registry.operation =
+                          { binding; state = Registry.Ready; line; source = script_source; expected_revision;
+                            cursor = 0L;
+                            parent = id (Format.asprintf "root-%s" (T.Id.get line));
+                            pending = None; terminal = None; aux = None; last_ack = None;
+                            acked_through = 0L; line_revision = expected;
+                            doc = None;
+                            cancel_seq_seen = 0L; cancel_generation = 1L; stop_requested = false;
+                            token = None; interrupt_snapshot = None; terminal_receipt = None;
+                            root_state = None }
+                        in
+                        Registry.register_operation binding operation;
+                        (* 线表登记（spec §1.1）：BeginLine 建主线，frontier=root 节点。 *)
+                        Registry.register_line line ~revision:expected
+                          ~frontier:operation.parent ~frontier_state:None ~group:None
+                          ~kind:Registry.Mainline;
+                        status header operation
+                    | `Continue line_state ->
+                        (* 续接：parent = 线前沿节点，执行栈起点 = 前沿节点的真实 state
+                           （前沿为 root ⇒ None，从 workspace init 起算）；新脚本 cursor
+                           从 0 开始。线表（kind/group/revision/frontier）原样保留——
+                           fork 登记的探索组不得被这里覆盖（Rust 候选 ACK 核
+                           ack.group = Known）。 *)
+                        let operation : Registry.operation =
+                          { binding; state = Registry.Ready; line; source = script_source; expected_revision;
+                            cursor = 0L;
+                            parent = line_state.frontier;
+                            pending = None; terminal = None; aux = None; last_ack = None;
+                            acked_through = 0L; line_revision = expected;
+                            doc = None;
+                            cancel_seq_seen = 0L; cancel_generation = 1L; stop_requested = false;
+                            token = None; interrupt_snapshot = None; terminal_receipt = None;
+                            root_state = line_state.frontier_state }
+                        in
+                        Registry.register_operation binding operation;
+                        status header operation)
   | T.PullStepRequest (header, binding, expected_step_seq) ->
       let operation = with_tables (fun () -> Registry.find_operation binding) in
       begin match operation with
@@ -774,9 +832,11 @@ let step_reply ~request request_view =
                   (match Registry.find_line operation.line with
                    | Some line_state -> line_state.revision <- operation.line_revision
                    | None -> ());
+                  (* ACK 结束一个组事务：探索线带推进后的组快照；主线 None。 *)
+                  let group = advance_line_group operation in
                   let ack = T.make_ack (T.ack_proof_receipt proof) ~line:operation.line
                     ~line_revision:(uint operation.line_revision)
-                    ~acked_through:(uint operation.acked_through) ~group:None in
+                    ~acked_through:(uint operation.acked_through) ~group in
                   operation.last_ack <- Some ack; T.ack_reply header ack
               | _ ->
                   T.make_protocol_error header T.binding_conflict T.not_admitted T.fact_unknown
@@ -886,15 +946,43 @@ let step_reply ~request request_view =
                           let line_id = id line_key in
                           let revision = uint line_state.revision in
                           let cursor = uint context_op.cursor in
+                          let cursor_int = Int64.to_int context_op.cursor in
                           let build_aux outcome =
                             T.make_locator_terminal binding ~line:line_id
                               ~node:line_state.frontier ~revision ~cursor outcome in
-                          let boundary_of node index =
-                            let r = Fleche.Doc.Node.range node in
+                          (* 定位边界的入口 = 当前已执行前沿（审核 8）：Rust
+                             spawn.rs:1848 located 时要求 fact.entry_node = aux.node
+                             且 fact.entry_offset = aux.cursor；设计：entry_node 为真实
+                             可恢复前驱、entry_offset 为其消费终点。entry_command =
+                             前沿节点的 parser 消费区间（句末 = cursor）；前沿为 root
+                             或节点对不上 ⇒ 零长 [cursor, cursor)，不借用目标节点的
+                             区间冒充入口。 *)
+                          let frontier_command doc =
+                            let rec last acc = function
+                              | [] -> acc
+                              | node :: rest ->
+                                  let open Fleche.Doc.Node in
+                                  if ast node <> None
+                                     && not (List.exists Lang.Diagnostic.is_error (diags node))
+                                     && (range node).end_.offset <= cursor_int
+                                  then last (Some node) rest
+                                  else last acc rest
+                            in
+                            match last None doc.Fleche.Doc.nodes with
+                            | Some node when (Fleche.Doc.Node.range node).end_.offset = cursor_int ->
+                                let r = Fleche.Doc.Node.range node in
+                                Some (r.start.offset, cursor_int)
+                            | _ -> None
+                          in
+                          let located_boundary doc =
+                            let start, stop =
+                              match frontier_command doc with
+                              | Some range -> range
+                              | None -> (cursor_int, cursor_int) in
                             T.make_entry_boundary header binding ~target:logical_target
-                              ~node:(ledger_node line_key index)
-                              ~command_start:(uint (Int64.of_int r.start.offset))
-                              ~command_end:(uint (Int64.of_int r.end_.offset))
+                              ~node:line_state.frontier
+                              ~command_start:(uint (Int64.of_int start))
+                              ~command_end:(uint (Int64.of_int stop))
                           in
                           let outcome =
                             match target with
@@ -903,50 +991,28 @@ let step_reply ~request request_view =
                                 (match ensure_doc () with
                                  | None -> `Rejected
                                  | Some doc ->
+                                     let located = build_aux (T.LocatedBoundary (located_boundary doc)) in
+                                     let needs_prefix () =
+                                       `Done (build_aux (T.PrefixRequired (target_rest, None))) in
                                      (match target_rest with
                                       | T.Theorem name ->
                                           let open Lang.Compat.String.Map in
                                           (match find_opt (T.Text.get name) doc.Fleche.Doc.toc with
-                                           | Some toc_node ->
-                                               (match node_index doc toc_node with
-                                                | Some index ->
-                                                    `Done
-                                                      (build_aux
-                                                         (T.LocatedBoundary
-                                                            (boundary_of toc_node index)))
-                                                | None ->
-                                                    (* toc 节点不在 nodes：按前沿+节点区间构造。 *)
-                                                    `Done
-                                                      (build_aux
-                                                         (T.LocatedBoundary
-                                                            (boundary_of toc_node 0))))
-                                           | None ->
-                                               `Done
-                                                 (build_aux (T.PrefixRequired (target_rest, None))))
+                                           | Some _ -> `Done located
+                                           | None -> needs_prefix ())
                                       | T.Position (line, character) ->
                                           let l = Int64.to_int (T.U.get line)
                                           and c = Int64.to_int (T.U.get character) in
-                                          (match covering_node doc l c with
-                                           | Some (index, node) ->
-                                               `Done
-                                                 (build_aux (T.LocatedBoundary (boundary_of node index)))
-                                           | None ->
-                                               `Done
-                                                 (build_aux (T.PrefixRequired (target_rest, None))))
+                                          if covering_node doc l c then `Done located
+                                          else needs_prefix ()
                                       | T.EndTarget ->
                                           (match doc.Fleche.Doc.completed with
                                            | Fleche.Doc.Completion.Yes _ ->
                                                (match List.rev doc.Fleche.Doc.nodes with
                                                 | last :: _ when Fleche.Doc.Node.ast last <> None ->
-                                                    let index =
-                                                      List.length doc.Fleche.Doc.nodes - 1 in
-                                                    `Done
-                                                      (build_aux
-                                                         (T.LocatedBoundary (boundary_of last index)))
+                                                    `Done located
                                                 | _ -> `Done (build_aux T.LocatedRoot))
-                                           | _ ->
-                                               `Done
-                                                 (build_aux (T.PrefixRequired (target_rest, None))))
+                                           | _ -> needs_prefix ())
                                       | T.Root -> assert false))
                           in
                           match outcome with
@@ -1051,8 +1117,11 @@ let step_reply ~request request_view =
                           let group_rev = match parent.group with
                             | Some (_, rev) -> Int64.succ rev
                             | None -> 1L in
+                          (* 新线继承父线前沿及其真实 state：候选 BeginLine 以
+                             revision = 父线版本准入（不再要求 0），执行从该节点续算。 *)
                           Registry.register_line new_line
                             ~revision:(T.U.get expected_rev) ~frontier:parent_node
+                            ~frontier_state:parent.frontier_state
                             ~group:(Some (exploration, group_rev)) ~kind:Registry.Exploration;
                           let aux = T.make_fork_terminal binding ~line:new_line
                             ~node:parent_node ~revision:expected_rev
@@ -1135,25 +1204,54 @@ let step_reply ~request request_view =
       (* NC04/NC06/NC08：路由 Pet_checkpoint_dispatch（admit + make_aux_operation
          在 dispatch 内，line 记 binding.context）。 *)
       Checkpoint_dispatch.run_request ~request ~header ~view
-   | T.SettleInterruptRequest (header, binding) ->
+    | T.SettleInterruptRequest (header, binding) ->
       (* spec §1.2 中断落定（幂等/兜底）：pull 内联落定已发布终态 ⇒ 原样重放
          （驱动端 settle 期待 Terminal，protocol_error 会隔离实例）；
+         aux 终态操作（checkpoint / sync / refresh / query / inspect）同样原样
+         重放 aux——Rust settle_checkpoint_operation / settle_inspection_interrupt
+         期待 AuxTerminal；旧实现只看 op.terminal ⇒ 取消落在两步之间时回
+         invalid_state ⇒ 驱动 ProtocolUnresolved + 隔离（inspection.rs:486-489）；
          未落定且有父快照 ⇒ 原恢复期限内恢复；否则 invalid_state。 *)
       with_tables (fun () ->
           match Registry.find_operation binding with
           | None ->
               T.make_protocol_error header T.unknown_operation T.not_admitted T.fact_unknown
           | Some op ->
-              (match op.terminal with
-               | Some record -> T.terminal_reply header record
-               | None ->
+              (match op.terminal, op.aux with
+               | Some record, _ -> T.terminal_reply header record
+               | None, Some aux -> T.locator_reply header aux
+               | None, None ->
                    (match op.interrupt_snapshot with
+                    | Some snapshot -> settle_interrupted_reply header op snapshot
+                    | None when op.stop_requested && op.pending = None
+                                  && op.state <> Registry.Executing ->
+                        (* 取消落在两步之间：取消已受理、无在途步、无未 ACK 步 ⇒
+                           操作停在 ACK 父节点且 doc 与之同步，如实发布 Interrupted
+                           终态（stopped/synchronized=Known true、last_acked=父、
+                           pending=N/A）。Rust settle 只接受 Terminal 或 pending 回执
+                           （interrupt.rs:418-421），旧实现回 invalid_state ⇒ 驱动
+                           checked_mainline_transport 隔离。 *)
+                        let record =
+                          T.make_interrupted_terminal op.binding
+                            (uint (Int64.succ op.acked_through))
+                            ~stopped:(T.FKnown true)
+                            ~synchronized:(T.FKnown true)
+                            ~last_acked:(T.FKnown op.parent)
+                            ~pending:T.FNotApplicable
+                            ~recoverable:(T.FKnown true)
+                            ~diagnostic:T.FUnknown
+                            ~extent:T.CompleteKnown
+                        in
+                        op.terminal <- Some record;
+                        (* 与恢复路径同款清账本：代际 +1、清 stop_requested、无 token。 *)
+                        op.cancel_generation <- Int64.succ op.cancel_generation;
+                        op.stop_requested <- false;
+                        op.token <- None;
+                        T.terminal_reply header record
                     | None ->
                         (* 无在途中断（取消未请求或未真实发生）⇒ invalid_state。 *)
                         T.make_protocol_error header T.invalid_state T.not_admitted
-                          T.fact_unknown
-                    | Some snapshot ->
-                        settle_interrupted_reply header op snapshot)))
+                          T.fact_unknown)))
   | T.OtherRequest (header, _) ->
       T.make_protocol_error header T.invalid_input T.not_admitted T.fact_unknown
 

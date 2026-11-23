@@ -229,7 +229,8 @@ let pull_download (transfer : T.checkpoint_transfer) ~seq ~offset ~credit :
                 d.pending <- Some (seq, end_offset, text);
                 `Chunk (offset, end_offset, text, end_offset = total))
 
-(* ack：核对 pending 块的 seq/end_offset/块 SHA-256 ⇒ 推进游标；旧 seq ⇒ Retired。 *)
+(* ack：核对 pending 块的 seq/end_offset/块 SHA-256 ⇒ 推进游标；同 seq 同 end_offset
+    的重发 ⇒ 幂等回 `Acked 不推进；更小 seq ⇒ `Retired。 *)
 let ack_download transfer_id ~operation ~seq ~end_offset ~digest :
     [`Acked of int64 * int64 | `Retired of int64 | `Rejected | `Absent] =
   with_lock (fun () ->
@@ -247,7 +248,9 @@ let ack_download transfer_id ~operation ~seq ~end_offset ~digest :
                   `Acked (seq, pending_end)
                 end
                 else `Rejected
-            | _ when seq <= d.seq -> `Retired d.offset
+            | _ when seq = d.seq && seq > 0L && end_offset = d.offset ->
+                `Acked (seq, d.offset)
+            | _ when seq < d.seq -> `Retired d.offset
             | _ -> `Rejected)
 
 (* release：真实清理（释放封存字节、置 released；表项保留以对后续 pull/ack

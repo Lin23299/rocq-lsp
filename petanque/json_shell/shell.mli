@@ -33,10 +33,16 @@ val make_doc :
   token:Coq.Limits.Token.t -> uri:Lang.LUri.File.t -> raw:string ->
   Fleche.Doc.t
 
+(** [make_doc_at ~uri ~raw ~root] 以真实已执行节点 state 为执行起点的文档（同线
+    续接 / fork 探索线）；root 必须来自真实节点谱系。 *)
+val make_doc_at :
+  uri:Lang.LUri.File.t -> raw:string -> root:Coq.State.t -> Fleche.Doc.t
+
+(** [step_doc] 的 [`Step] 带 (句末字节偏移, 所执行节点的真实 state)。 *)
 val step_doc :
      token:Coq.Limits.Token.t -> doc:Fleche.Doc.t -> cursor:int ->
      Fleche.Doc.t *
-     [ `Step of int | `Eof | `Error of [ `Parse | `Execute ] | `Unknown
+     [ `Step of int * Coq.State.t | `Eof | `Error of [ `Parse | `Execute ] | `Unknown
      | `Interrupted of [ `Parse | `Execute ] ]
 
 (** [snapshot_doc doc] 步前快照：共享不可变结构，纯记录（传回同一 doc）。 *)

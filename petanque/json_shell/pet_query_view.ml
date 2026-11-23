@@ -215,40 +215,46 @@ let serve_pull header ~view ~operation ~seq ~offset ~credit =
                  spool.pending <- Some (seq, end_offset, text);
                  make_chunk text end_offset)
 
-(* ack：核 pending seq/end_offset/块文本 SHA-256 ⇒ 推进游标；旧 seq ⇒ retired。 *)
+(* ack：核 pending seq/end_offset/块文本 SHA-256 ⇒ 推进游标；同 seq 同 end_offset 的
+    重发（Rust inspection.rs:803-804 `recent`：ACK 回复丢失后原样重发）⇒ 幂等回
+    Acked，不推进；更小 seq ⇒ retired（`older` 只在更小时接受 Retired）。 *)
 let serve_ack header ~view ~operation ~seq ~end_offset ~digest =
   Mutex.lock lock;
   Fun.protect
     ~finally:(fun () -> Mutex.unlock lock)
     (fun () ->
-       match find_spool view operation with
-       | `Absent -> None
-       | `Mismatch ->
-           Some (T.make_view_ack_error header T.invalid_input T.not_admitted)
-       | `Owned spool ->
-           let seq = T.U.get seq in
-           let error () =
-             Some (T.make_view_ack_error header T.invalid_input T.not_admitted)
-           in
-           match spool.pending with
-           | Some (pending_seq, pending_end, text) when pending_seq = seq ->
-               if T.U.get end_offset = pending_end
-                  && S.sha256 text = T.Digest.get digest
-               then begin
-                 spool.pending <- None;
-                 spool.offset <- pending_end;
-                 spool.seq <- seq;
-                 Some
-                   (T.make_view_acked header ~view ~operation ~seq:(uint seq)
-                      ~end_offset)
-               end
-               else error ()
-           | _ when seq <= spool.seq ->
-               Some
-                 (T.make_view_ack_retired header ~view ~operation
-                    ~requested_seq:(uint seq) ~acked_through:(uint spool.seq)
-                    ~end_offset:(uint spool.offset))
-           | _ -> error ())
+        match find_spool view operation with
+        | `Absent -> None
+        | `Mismatch ->
+            Some (T.make_view_ack_error header T.invalid_input T.not_admitted)
+        | `Owned spool ->
+            let seq = T.U.get seq in
+            let error () =
+              Some (T.make_view_ack_error header T.invalid_input T.not_admitted)
+            in
+            match spool.pending with
+            | Some (pending_seq, pending_end, text) when pending_seq = seq ->
+                if T.U.get end_offset = pending_end
+                   && S.sha256 text = T.Digest.get digest
+                then begin
+                  spool.pending <- None;
+                  spool.offset <- pending_end;
+                  spool.seq <- seq;
+                  Some
+                    (T.make_view_acked header ~view ~operation ~seq:(uint seq)
+                       ~end_offset)
+                end
+                else error ()
+            | _ when seq = spool.seq && seq > 0L
+                      && T.U.get end_offset = spool.offset ->
+                (* 已确认过的同一 ACK 原样重发：幂等重放，游标不动。 *)
+                Some (T.make_view_acked header ~view ~operation ~seq:(uint seq) ~end_offset)
+            | _ when seq < spool.seq ->
+                Some
+                  (T.make_view_ack_retired header ~view ~operation
+                     ~requested_seq:(uint seq) ~acked_through:(uint spool.seq)
+                     ~end_offset:(uint spool.offset))
+            | _ -> error ())
 
 (* release：核 last_acked fact（Known=spool.seq / N/A=从未确认）；pending 未清
    ⇒ Closing（spool 保留，可续读原 pull）；否则真实清理（丢弃全文）后 Released，
