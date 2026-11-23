@@ -177,6 +177,7 @@ let handshake boot fd channel =
    highest_seen/retired_through/with_tables 统一走 Registry。 *)
 module Registry = Pet_native_support.Pet_registry
 module Refresh = Pet_native_support.Pet_environment_refresh
+module Sync = Pet_native_support.Pet_source_sync
 
 let with_tables = Registry.with_tables
 
@@ -376,12 +377,29 @@ let rec view_loop fd =
         (match T.decode_view_request S.message_limits raw with
          | Ok request ->
              (match T.view_request_view request with
-              | T.PullViewRequest (header, _, _, _, _, _) ->
-                  Some (view_channel_error_encoded header `Pull)
-              | T.AckViewRequest (header, _, _, _, _, _) ->
-                  Some (view_channel_error_encoded header `Ack)
-              | T.ReleaseViewRequest (header, _, _, _) ->
-                  Some (view_channel_error_encoded header `Release))
+              | T.PullViewRequest (header, view, operation, seq, offset, credit) ->
+                  (* spec §1.5：先查 Pet_source_sync 的 line_updates spool；
+                     未接管（None）再走后续模块——本 item 后 query/inspect 仍无
+                     spool，回落 unknown_operation 回错。 *)
+                  (match Sync.serve_view_pull header ~view ~operation ~seq
+                          ~offset ~credit with
+                   | Some reply ->
+                       Some (get (T.encode_view_reply_pull S.message_limits reply))
+                   | None -> Some (view_channel_error_encoded header `Pull))
+              | T.AckViewRequest (header, view, operation, seq, end_offset, digest) ->
+                  (match Sync.serve_view_ack header ~view ~operation ~seq
+                          ~end_offset ~digest with
+                   | Some reply ->
+                       Some (get (T.encode_view_reply_ack S.message_limits reply))
+                   | None -> Some (view_channel_error_encoded header `Ack))
+              | T.ReleaseViewRequest (header, view, operation, last_acked) ->
+                  (match Sync.serve_view_release header ~view ~operation ~last_acked
+                  with
+                   | Some reply ->
+                       Some
+                         (get
+                            (T.encode_view_reply_release S.message_limits reply))
+                   | None -> Some (view_channel_error_encoded header `Release)))
          | Error _ ->
              (* 解码失败：尽力回显 header 回错；拿不到则丢弃。 *)
              (match frame_header raw with
@@ -978,8 +996,31 @@ let step_reply ~request request_view =
                           Registry.register_operation binding operation;
                           T.locator_reply header aux
                         end)))
-  | T.SyncSourceRequest (header, _, _, _, _, _, _) ->
-      T.make_protocol_error header T.invalid_input T.not_admitted T.fact_unknown
+  | T.SyncSourceRequest
+      (header, binding, context, (expected_ctx, expected_rev), old_source, new_source,
+       publication) ->
+      (* NN03 源码同步：路由 Pet_source_sync（模块锁→Registry 锁，路由侧不持
+         Registry 锁调用）；entry_uses_budget 准入在 admit_new 内完成。 *)
+      let admitted =
+        with_tables (fun () ->
+            match Registry.find_operation binding with
+            | Some _ -> `Existing
+            | None ->
+                (match admit_new header binding request with
+                 | `Rejected reply -> `Rejected reply
+                 | `Admitted ->
+                     Registry.highest_seen := T.U.get (T.op_seq binding);
+                     (* aux 操作登记：context 记账与 Registry 联动（本批单 context
+                        近似——主线 op/doc 作为 context 载体，在 Sync 内解析）。 *)
+                     Registry.register_operation binding
+                       (make_aux_operation binding context);
+                     `Fresh))
+      in
+      (match admitted with
+       | `Rejected reply -> reply
+       | `Existing | `Fresh ->
+           Sync.prepare_locked ~header ~binding ~context ~expected_ctx ~expected_rev
+             ~old_source ~new_source ~publication)
   | T.RefreshEnvironmentRequest (header, binding, old_env, new_env, publication) ->
       (* NN04：路由 Pet_environment_refresh（模块锁→Registry 锁，路由侧不持
          Registry 锁调用）。 *)
@@ -1046,6 +1087,8 @@ let serve () =
   let view = fd_of_int 7 in
   Registry.init ();
   Registry.set_input_quota (T.U.get (T.boot_input_quota boot));
+  (* NN03：boot 绑定注入源码同步模块（线表文档构造/视图配额用）。 *)
+  Sync.init ~boot;
   handshake boot ordinary T.Ordinary;
   handshake boot control T.Control;
   handshake boot source T.Source;
