@@ -19,3 +19,4 @@ examples/.vscode
 /lsp-server/jsoo/coq-fs-core.js
 /lsp-server/jsoo/coq_lsp_worker.bc.cjs
 /.vscode-test-web/
+.ccv-findlib/

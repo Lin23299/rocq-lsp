@@ -109,60 +109,29 @@ let handshake boot fd channel =
       write_frame fd (get (T.encode_peer S.message_limits (T.Ack ack)))
   | T.Ack _ -> fail "nativeface: expected hello"
 
-type source_data = Staging of bytes | Sealed of string
-type source = {
-  mutable data : source_data;
-  expected_digest : string;
-  mutable next_offset : int64;
-}
+(* 共享运行态已迁入 Pet_registry（spec §1）：sources/budgets/operations/
+   highest_seen/retired_through/with_tables 统一走 Registry。 *)
+module Registry = Pet_native_support.Pet_registry
 
-type operation = {
-  binding : T.op_binding;
-  line : T.Id.t;
-  source : T.Id.t;
-  expected_revision : T.U.t;
-  mutable cursor : int64;
-  mutable parent : T.Id.t;
-  mutable pending : T.receipt option;
-  mutable terminal : T.terminal_record option;
-  mutable last_ack : T.ack_status option;
-  mutable acked_through : int64;
-  mutable line_revision : int64;
-  mutable doc : Fleche.Doc.t option;
-}
+let with_tables = Registry.with_tables
 
-let sources : (string, source) Hashtbl.t = Hashtbl.create 17
-let budgets : (string, unit) Hashtbl.t = Hashtbl.create 17
-let reserved = ref 0L
-let highest_seen = ref 0L
 let uri_counter = ref 0
-let operations : (T.op_binding * operation) list ref = ref []
-let tables = Mutex.create ()
 
-let with_tables f = Mutex.lock tables; Fun.protect ~finally:(fun () -> Mutex.unlock tables) f
-
-let find_operation binding =
-  List.find_opt (fun (known, _) -> T.op_binding_equal known binding) !operations
-
-let source_bytes source_id = match Hashtbl.find_opt sources (T.Id.get source_id) with
-  | Some { data = Sealed raw; _ } -> Some raw
-  | _ -> None
-
-let source_handle quota request =
+let source_handle request =
   let reply =
     match T.source_request_view request with
     | T.SourceBeginRequest (header, source_id, size, expected_digest) ->
         with_tables (fun () ->
-            if Hashtbl.mem sources (T.Id.get source_id) then
+            if Registry.find_source (T.Id.get source_id) <> None then
               T.make_source_error header T.invalid_input T.not_admitted T.fact_unknown
-            else if T.U.get size > Int64.sub quota !reserved ||
-                    T.U.get size > Int64.of_int Sys.max_string_length then
+            else if T.U.get size > Int64.of_int Sys.max_string_length then
+              T.make_source_error header T.Capacity T.not_admitted T.fact_unknown
+            else if not (Registry.reserve_input (T.U.get size)) then
               T.make_source_error header T.Capacity T.not_admitted T.fact_unknown
             else begin
-              Hashtbl.add sources (T.Id.get source_id)
-                { data = Staging (Bytes.create (Int64.to_int (T.U.get size)));
+              Registry.add_source (T.Id.get source_id)
+                { data = Registry.Staging (Bytes.create (Int64.to_int (T.U.get size)));
                   expected_digest = T.Digest.get expected_digest; next_offset = 0L };
-              reserved := Int64.add !reserved (T.U.get size);
               T.make_source_begun header source_id (uint 0L)
             end)
     | T.SourceChunkRequest (header, source_id, offset, encoded) ->
@@ -173,8 +142,8 @@ let source_handle quota request =
         | Ok chunk ->
         let length = String.length chunk in
         with_tables (fun () ->
-            match Hashtbl.find_opt sources (T.Id.get source_id) with
-            | Some ({ data = Staging data; _ } as source) ->
+            match Registry.find_source (T.Id.get source_id) with
+            | Some ({ data = Registry.Staging data; _ } as source) ->
                 let offset_value = T.U.get offset in
                 if offset_value <> source.next_offset || length < 1 || length > 8192 ||
                    length > Bytes.length data - Int64.to_int source.next_offset then
@@ -193,17 +162,17 @@ let source_handle quota request =
         end
     | T.SourceFinishRequest (header, source_id) ->
         with_tables (fun () ->
-            match Hashtbl.find_opt sources (T.Id.get source_id) with
-            | Some ({ data = Staging data; _ } as source) ->
+            match Registry.find_source (T.Id.get source_id) with
+            | Some ({ data = Registry.Staging data; _ } as source) ->
                 let size = Int64.of_int (Bytes.length data) in
                 (* 锁内封存：通过后再无到可写缓冲的引用。 *)
                 let actual = Bytes.unsafe_to_string data in
                 if size <> source.next_offset || S.sha256 actual <> source.expected_digest then begin
-                  Hashtbl.remove sources (T.Id.get source_id);
-                  reserved := Int64.sub !reserved size;
+                  Registry.remove_source (T.Id.get source_id);
+                  ignore (Registry.release_input size);
                   T.make_source_error header T.invalid_input T.not_admitted T.fact_unknown
                 end else begin
-                  source.data <- Sealed actual;
+                  source.data <- Registry.Sealed actual;
                   T.make_source_registered header source_id (uint size)
                     source.expected_digest
                 end
@@ -214,22 +183,24 @@ let source_handle quota request =
   in
   reply
 
-let rec source_loop quota fd =
+let rec source_loop fd =
   let request = get (T.decode_source_request S.message_limits (read_frame fd)) in
-  let reply = source_handle quota request in
+  let reply = source_handle request in
   write_frame fd (get (T.encode_source_reply S.message_limits reply));
-  source_loop quota fd
+  source_loop fd
 
-let node_id operation step_seq =
+let node_id (operation : Registry.operation) step_seq =
   id (Format.asprintf "node-%s-%Ld" (T.Id.get operation.line) step_seq)
 
-let status header op =
+let status header (op : Registry.operation) =
   let state = match op.pending, op.terminal with
     | Some _, _ -> T.WaitAck | _, Some _ -> T.TerminalState | _ -> T.Ready in
-  T.make_status header op.binding state (uint op.acked_through) (uint !highest_seen)
+  T.make_status header op.binding state (uint op.acked_through)
+    ~highest_seen:(uint !Registry.highest_seen)
+    ~retired_through:(uint !Registry.retired_through)
     ~pending:op.pending ~terminal:op.terminal ~last_ack:op.last_ack
 
-let pull header op =
+let pull header (op : Registry.operation) =
   let token = Coq.Limits.Token.create () in
   let doc = match op.doc with
     | Some doc -> doc
@@ -237,7 +208,7 @@ let pull header op =
         incr uri_counter;
         let uri = Lang.LUri.of_string (Format.asprintf "file:///tmp/ccv_native_%d_%d.v"
             (Unix.getpid ()) !uri_counter) |> Lang.LUri.File.of_uri |> get in
-        let raw = with_tables (fun () -> Option.get (source_bytes op.source)) in
+        let raw = with_tables (fun () -> Option.get (Registry.source_bytes op.source)) in
         Shell.make_doc ~token ~uri ~raw in
   let doc, outcome = Shell.step_doc ~token ~doc ~cursor:(Int64.to_int op.cursor) in
   let seq = uint (Int64.succ op.acked_through) in
@@ -245,7 +216,8 @@ let pull header op =
   match outcome with
   | `Eof -> finish (T.make_eof op.binding seq ~acked_through:(uint op.acked_through)
                       ~cursor:(uint op.cursor))
-  | `Error stage -> finish (T.error_terminal op.binding seq ~parse:(stage = `Parse) ~last_valid:op.parent)
+  | `Error stage -> finish (T.error_terminal op.binding seq ~parse:(stage = `Parse)
+                              ~last_valid:op.parent ~group:None)
   | `Unknown -> fail "nativeface: single-step outcome unknown"
   | `Step stop ->
       let node = node_id op (T.U.get seq) and next_cursor = uint (Int64.of_int stop) in
@@ -264,37 +236,41 @@ let step_reply request =
         T.make_protocol_error header T.invalid_input T.not_admitted T.fact_unknown
       else
         with_tables (fun () ->
-            match find_operation binding with
-            | Some (_, op) when op.line = line && op.expected_revision = expected_revision && op.source = script_source -> status header op
+            match Registry.find_operation binding with
+            | Some op when op.line = line && op.expected_revision = expected_revision && op.source = script_source -> status header op
             | Some _ -> T.make_protocol_error header T.BindingConflict T.ExistingOperation T.fact_unknown
-            | None when T.U.get (T.op_seq binding) <> Int64.succ !highest_seen ->
+            | None when T.U.get (T.op_seq binding) <> Int64.succ !Registry.highest_seen ->
                 T.make_protocol_error header T.SequenceGap T.not_admitted T.fact_unknown
+            | None when T.U.get (T.op_seq binding) <= !Registry.retired_through ->
+                (* 已 retire 的序号：按 spec §1 返回 past_unavailable。 *)
+                T.make_past_unavailable header (T.op_seq binding)
+                  (uint !Registry.highest_seen)
             | None ->
-                highest_seen := T.U.get (T.op_seq binding);
-                begin match source_bytes script_source with
+                Registry.highest_seen := T.U.get (T.op_seq binding);
+                begin match Registry.source_bytes script_source with
                 | _ when T.U.get expected_revision <> 0L ->
                     T.make_protocol_error header T.StaleRevision T.not_admitted T.fact_unknown
                 | None ->
                     T.make_protocol_error header T.invalid_input T.not_admitted T.fact_unknown
-                | Some _ when not (Hashtbl.mem budgets (T.Id.get (T.op_binding_budget binding))) ->
+                | Some _ when Registry.find_budget (T.op_binding_budget binding) = None ->
                     T.make_protocol_error header T.invalid_input T.not_admitted T.fact_unknown
                 | Some _ ->
-                    let operation =
-                      { binding; line; source = script_source; expected_revision;
+                    let operation : Registry.operation =
+                      { binding; state = Registry.Ready; line; source = script_source; expected_revision;
                         cursor = 0L;
                         parent = id (Format.asprintf "root-%s" (T.Id.get line));
-                        pending = None; terminal = None; last_ack = None;
+                        pending = None; terminal = None; aux = None; last_ack = None;
                         acked_through = 0L; line_revision = T.U.get expected_revision;
                         doc = None }
                     in
-                    operations := (binding, operation) :: !operations;
+                    Registry.register_operation binding operation;
                     status header operation
                 end)
   | T.PullStepRequest (header, binding, expected_step_seq) ->
-      let operation = with_tables (fun () -> find_operation binding) in
+      let operation = with_tables (fun () -> Registry.find_operation binding) in
       begin match operation with
       | None -> T.make_protocol_error header T.unknown_operation T.not_admitted T.fact_unknown
-      | Some (_, op) ->
+      | Some op ->
           if T.U.get expected_step_seq <> Int64.succ op.acked_through then
             T.make_protocol_error header T.invalid_state T.ExistingOperation T.fact_unknown
           else match op.pending, op.terminal with
@@ -304,16 +280,17 @@ let step_reply request =
       end
   | T.AckStepRequest (header, binding, proof) ->
       with_tables (fun () ->
-          match find_operation binding with
-          | Some (_, operation) ->
+          match Registry.find_operation binding with
+          | Some operation ->
               begin match operation.pending with
-              | Some pending when T.receipt_key_equal (T.receipt_key pending) proof ->
+              | Some pending when T.receipt_key_equal (T.receipt_key pending)
+                    (T.ack_proof_receipt proof) ->
                   operation.pending <- None;
                   operation.acked_through <- Int64.succ operation.acked_through;
                   operation.line_revision <- Int64.succ operation.line_revision;
-                  let ack = T.make_ack proof ~line:operation.line
+                  let ack = T.make_ack (T.ack_proof_receipt proof) ~line:operation.line
                     ~line_revision:(uint operation.line_revision)
-                    ~acked_through:(uint operation.acked_through) in
+                    ~acked_through:(uint operation.acked_through) ~group:None in
                   operation.last_ack <- Some ack; T.ack_reply header ack
               | _ ->
                   T.make_protocol_error header T.binding_conflict T.not_admitted T.fact_unknown
@@ -322,23 +299,55 @@ let step_reply request =
               T.make_protocol_error header T.unknown_operation T.not_admitted T.fact_unknown)
   | T.OperationStatusRequest (header, binding) ->
       with_tables (fun () ->
-          match find_operation binding with
-          | Some (_, operation) ->
+          match Registry.find_operation binding with
+          | Some operation ->
               status header operation
           | None ->
               T.make_protocol_error header T.unknown_operation T.not_admitted T.fact_unknown)
   | T.FinishOperationRequest (header, binding, key) ->
       with_tables (fun () ->
-          match find_operation binding with
-          | Some (_, { terminal = Some t; _ }) when T.receipt_key_equal (T.terminal_key t) key ->
+          match Registry.find_operation binding with
+          | Some { terminal = Some t; _ } when T.receipt_key_equal (T.terminal_key t) key ->
               T.make_finished header key
           | Some _ -> T.make_protocol_error header T.BindingConflict T.ExistingOperation T.fact_unknown
           | None ->
               T.make_protocol_error header T.unknown_operation T.not_admitted T.fact_unknown)
-  | T.RegisterBudgetRequest (header, budget, grant) ->
+  | T.RegisterBudgetRequest (header, budget, _grant) ->
+      (* NW02：存完整 T.native_budget；同内容幂等回原登记，异内容冲突。 *)
       with_tables (fun () ->
-          Hashtbl.replace budgets (T.Id.get budget) ();
-          T.make_budget_registered header budget grant (uint 1L))
+          match Registry.add_budget budget with
+          | `Ok ->
+              T.make_budget_registered header (T.budget_id budget)
+                (T.budget_grant budget) (T.budget_revision budget)
+          | `Conflict ->
+              T.make_protocol_error header T.BindingConflict T.ExistingOperation T.fact_unknown)
+  | T.RetireThroughRequest (header, through) ->
+      (* 更新退役水位（单调取 max），水位及以下的操作此后 past_unavailable。 *)
+      with_tables (fun () ->
+          if Int64.compare (T.U.get through) !Registry.retired_through > 0 then
+            Registry.retired_through := T.U.get through;
+          T.make_retired header through)
+  (* 以下分支本 item 后续块接线；当前按 spec §0 拒绝口径占位，不伪造成功。 *)
+  | T.LocateContextRequest (header, _) ->
+      T.make_protocol_error header T.invalid_input T.not_admitted T.fact_unknown
+  | T.SelectLineRequest (header, _) ->
+      T.make_protocol_error header T.invalid_input T.not_admitted T.fact_unknown
+  | T.ForkLineRequest (header, _) ->
+      T.make_protocol_error header T.invalid_input T.not_admitted T.fact_unknown
+  | T.SyncSourceRequest (header, _, _, _, _, _, _) ->
+      T.make_protocol_error header T.invalid_input T.not_admitted T.fact_unknown
+  | T.RefreshEnvironmentRequest (header, _, _, _, _) ->
+      T.make_protocol_error header T.invalid_input T.not_admitted T.fact_unknown
+  | T.QueryRequest (header, _, _, _, _) ->
+      T.make_protocol_error header T.invalid_input T.not_admitted T.fact_unknown
+  | T.InspectRequest (header, _, _, _, _) ->
+      T.make_protocol_error header T.invalid_input T.not_admitted T.fact_unknown
+  | T.EndScopeRequest (header, _, _, _) ->
+      T.make_protocol_error header T.invalid_input T.not_admitted T.fact_unknown
+  | T.CheckpointRequest (header, _) ->
+      T.make_protocol_error header T.invalid_input T.not_admitted T.fact_unknown
+  | T.SettleInterruptRequest (header, _) ->
+      T.make_protocol_error header T.invalid_input T.not_admitted T.fact_unknown
   | T.OtherRequest (header, _) ->
       T.make_protocol_error header T.invalid_input T.not_admitted T.fact_unknown
 
@@ -350,11 +359,13 @@ let serve () =
   in
   let ordinary = fd_of_int 4 in
   let source = fd_of_int 6 in
+  Registry.init ();
+  Registry.set_input_quota (T.U.get (T.boot_input_quota boot));
   handshake boot ordinary T.Ordinary;
   handshake boot (fd_of_int 5) T.Control;
   handshake boot source T.Source;
   handshake boot (fd_of_int 7) T.View;
-  ignore (Thread.create (source_loop (T.U.get (T.boot_input_quota boot))) source);
+  ignore (Thread.create source_loop source);
   let rec loop () =
     let request = get (T.decode_native_request S.message_limits (read_frame ordinary)) in
     let reply = step_reply (T.native_request_view request) in
