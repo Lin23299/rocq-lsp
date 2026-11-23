@@ -1,0 +1,14 @@
+# 任务：item 2 —— pet_source_sync.ml + pet_source_prefix.ml（NN03 源码同步）
+
+先读：.ccv-spec/spec.md §0 与 §2 全文；.ccv-spec/refs/protocol/types.mli（重点 make_native_line_change / make_native_line_update_document / make_source_synced_terminal / make_view_chunk / make_view_acked / make_view_pull_retired / make_view_ack_retired / make_view_released / view_request_view / make_view_*_error）；.ccv-spec/refs/native/line_updates.rs（Rust 消费侧行为规格，逐条核你产出的块/文档字段）；petanque/json_shell/{pet_registry.ml,pet_native.ml 现状}。
+
+交付：
+1. pet_source_prefix.ml（spec §2 签名）：lcp（字节 LCP、UTF-8 字符边界安全——落不进字符边界就回退）；retain（Fleche retain adapter：new==old 原样 changed=false；否则 Fleche.Doc.bump_version + check 到 LCP 位置的 Position 目标；保留前缀=新 doc 中 end≤LCP、无 error diag、ast 非空的连续前驱链；prefix_end=最后保留节点 end offset，无保留节点=0）；horizon_of（read_end=下一未验证节点起点或最后节点 end；saw_eof=completed Yes）。
+2. pet_source_sync.ml（spec §2）：contexts/sync 状态（自持 Mutex，锁序同 refresh：模块锁→Registry 锁）；prepare_locked 按 spec 六步（核验/幂等/拒绝与未知区分/同内容 no-op 完整线表/变化 retain+线表逐线+context revision+1/line_updates 封存+原子映射发布）；RETIRING 未决语义（该 context 有 pending 步 ⇒ make_retiring_status，同 binding 续调）。
+   - 线表投影：该 context 的全部公开线从 Registry.iter_lines 取（按 line ID 排序去重）；make_native_line_update_document 的 boot 参数需要 native_boot_binding——serve() 时把 boot 传入 init（Pet_source_sync.init ~boot）。
+   - spool：T.encode_native_line_update_document 的字节写 temp 文件（Filename.temp_file "ccv_line_updates"），登记 {view id; digest=S.sha256 bytes; bytes=len; path; 游标/seq/ack/release 状态}。view id 格式 view-<operation id>-<op seq>。原子发布：图变化（Registry 线表/context 记账）与 spool 登记同一模块锁临界区。
+   - make_source_synced_terminal：revision=新 context revision（变化）或原 revision（no-op）；last_valid=FKnown 主线 frontier；reclaim=FKknown 新 id（reclaim-sync-<op id>）；boundary：同内容 FNotApplicable；变化时若保留前缀非空 FKnown(make_entry_boundary … entry 用最后保留节点) 否则 FUnknown。view/digest/bytes 用 spool ref。extent 由 make_*_terminal 内定，不额外包。
+3. view 通道服务：pet_native.ml 的 view_loop 里 view_pull/ack/release 改为路由 Pet_source_sync.serve_view_pull/ack/release（先查 sync spool；查不到再走后续模块——本 item 后 query/inspect 仍无 spool，回落现有 unknown_operation 回错）。块语义按 spec §2（credit 4..8192、seq=last_ack+1 或重放 pending、offset=已确认偏移、最大完整 UTF-8 前缀、eof=到达 bytes；capture complete/bytes/total/digest/missing=[]/reason=N/A——line_updates.rs checked_line_update_pull 逐项核）。ack：核 seq/end_offset/块 digest(S.sha256 文本)；推进游标；旧 seq make_view_ack_retired。release：核 last_acked fact；真实清理（关闭+unlink）后才 Released；有 pending 未清 ⇒ Closing（make_view_released status=ClosingStatus）。
+4. pet_native.ml SyncSourceRequest 路由接入（T.SyncSourceRequest (header,binding,context,(old_source,expected_rev),new_source,publication) 解包）：admit_new 准入 + 登记 aux operation 后调 Pet_source_sync.prepare_locked；context 记账与 Registry 联动（context→line/doc 挂钩：本批单 context 近似——用 locate_context_line 同款查找主线 op/doc 作为 context 载体；多 context 留待后续，注释说明）。dune modules 追加两文件。
+5. 构建（spec §0 命令，OCAMLPATH 三段）零错误；进度写 .ccv-spec/progress-2.md；不 commit。
+纪律：注释中文；拒绝与已尝试未知区分；不伪造；不动其它模块。
