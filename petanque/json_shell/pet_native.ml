@@ -887,6 +887,12 @@ let step_reply ~request request_view =
       (* spec §1.1 内联最小真实：单实例单 context，在当前主线 doc 上定位。 *)
       let binding, _file, _relative_file, target, logical_target, lineage, expected_context =
         T.locate_fields args in
+      (* context 版本由 Pet_source_sync 独立记账（变化同步 +1，与线版本无关）；其锁序
+         为 Sync 锁 → Registry 锁，须在进入 Registry 锁前读取（审核 9：拿线版本核
+         context 版本 ⇒ 同步后必 StaleRevision）。 *)
+      let binding_context =
+        match T.op_binding_line_owner binding with context, _, _ -> context in
+      let sync_context_rev = Sync.context_revision ~context:binding_context in
       with_tables (fun () ->
           match Registry.find_operation binding with
           | Some { aux = Some aux; _ } ->
@@ -906,12 +912,18 @@ let step_reply ~request request_view =
                         let context_id =
                           match T.op_binding_line_owner context_op.binding with
                           | context, _, _ -> context in
+                        (* context 版本：已同步过 ⇒ Sync 记账版本；否则以主线线版本播种
+                           （与 Pet_source_sync 首次见到该 context 时的播种口径一致）。 *)
+                        let context_rev =
+                          match sync_context_rev with
+                          | Some rev -> rev
+                          | None -> line_state.revision in
                         (* expected_context / lineage 版本核对：可核才继续。 *)
                         let stale =
                           (match expected_context with
                            | Some (ctx, rev) ->
                                T.Id.get ctx <> T.Id.get context_id
-                               || T.U.get rev <> line_state.revision
+                               || T.U.get rev <> context_rev
                            | None -> false)
                           || (match lineage with
                               | Some (line_id, rev) ->

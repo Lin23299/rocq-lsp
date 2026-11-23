@@ -14,10 +14,12 @@
       eof iff 窗口到末尾，digest 为整个 part。
     - Assumptions：逐 root 以官方 AST（文本 "Print Assumptions <name>." 解析后核
       恰为一个 VernacSynPure(VernacPrint(PrintAssumptions(_,_,AN _)))、无 control/
-      attrs，杜绝文本注入）在节点状态上执行并捕获输出：首行 "Closed under the
-      global context" ⇒ AsmClosed；其余 ⇒ AsmAssumptions（行解析从简：非表头行
-      各为一项，首个 " :" 之前为 kernel_name，整行为 printed_type 子视图）；Coq
-      错误/取消/超限 ⇒ AsmUnavailable（error=Known 文本）；raw 为独立子视图。
+      attrs，杜绝文本注入）在节点状态上执行并捕获输出：按反馈 Pp 的结构切分
+      （标题节 / fnl 分隔的条目；不按渲染折行）——"Closed under the global
+      context" ⇒ AsmClosed；其余 ⇒ AsmAssumptions，每条在首个 ':' 处切成
+      kernel_name 与单独渲染的 printed_type 子视图（长类型的续行归回同一条）；
+      结构不符 / Coq 错误 / 取消 / 超限 ⇒ AsmUnavailable（error=Known 文本）；
+      raw 为独立子视图。
     - Environment / Notations：本批拒绝（M5 可信 snapshot / 固定 Rocq 纯接口未接，
       不留假数据）。
     产出：payload 字节 → 内层 complete capture → facts 文档（node/source/
@@ -304,30 +306,120 @@ let assumptions_ast ~token ~st name =
        | _ -> None)
   | Ok _ -> None
 
-let split_lines text =
-  String.split_on_char '\n' text |> List.map String.trim |> List.filter (fun l -> l <> "")
-
-(* 表头行：仅字母/空格且以冒号结尾（"Axioms:"、"Variables and Axioms:" 之类）。 *)
-let header_line line =
-  let n = String.length line in
-  n > 0 && line.[n - 1] = ':'
-  && String.for_all
-       (fun c -> (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c = ' ')
-       (String.sub line 0 (n - 1))
-
 let closed_line = "Closed under the global context"
 
-(* 首个 " :" 之前为 kernel_name（本批从简：不解析真实 kernel 名）。 *)
-let kernel_name_of line =
-  let n = String.length line in
-  let rec go i =
-    if i >= n then Some line
-    else if line.[i] = ':' && i > 0 && line.[i - 1] = ' ' then Some (String.sub line 0 (i - 1))
-    else go (i + 1)
-  in
-  go 0
+(* —— Print Assumptions 输出解析：按 Pp 结构切分，不按渲染行 ——
+   Rocq 9.0 Printer.pr_assumptionset 的输出结构固定：
+   - 单字符串 "Closed under the global context"；或
+   - 各节以 fnl 相接：标题 ++ fnl ++ v 0 (条目 ++ fnl ++ 条目 …)，标题 ∈
+     {Axioms:; Section Variables:; Theory:}（本模块只发不带修饰的 Print
+     Assumptions，故无 Transparent/Opaque constants 节）；条目 = hov 2 (名 ++
+     " :" ++ spc ++ 类型)（公理）或 名 ++ spc ++ ": " ++ 类型（节变量）；
+     Theory 节的条目是无冒号的整句。
+   Pp.string_of_ppcmds 按 78 列折行：长类型落在缩进续行上。旧实现逐行 split、
+   取首个 " :" 之前为名、整行为类型 ⇒ 类型截成 "名 :"、续行被当成伪造假设、其余
+   续行静默丢弃（审核 10）。这里：顶层 glue 扁平化后，标题之后紧跟的 vbox 0 的
+   直接子项以 fnl 分隔为条目；条目内在首个含 ':' 的字符串处切出名段与类型段，
+   类型段单独渲染（保留其自身折行）。结构与上述不符 ⇒ `Unrecognized（调用方按
+   AsmUnavailable 处理，raw 仍可核）。 *)
 
-let assumption_root ~parts ~(requested : T.Text.t) ~text ~failure =
+module Pp = Coq.Pp_t
+
+(* 顶层 glue 扁平化（不进入 box）。 *)
+let rec flatten_pp (d : Pp.doc_view) : Pp.doc_view list =
+  match d with
+  | Pp.Ppcmd_glue ts -> List.concat_map (fun t -> flatten_pp (Pp.repr t)) ts
+  | Pp.Ppcmd_empty -> []
+  | other -> [ other ]
+
+let render_pp (ds : Pp.doc_view list) : string =
+  Pp.to_string (Pp.unrepr (Pp.Ppcmd_glue (List.map Pp.unrepr ds)))
+
+let assumption_titles = [ "Axioms:"; "Section Variables:"; "Theory:" ]
+
+type assumption_entry = { kernel_name : string; printed_type : string }
+
+(* 一条：首个含 ':' 的字符串之前为名段；之后去掉前导 break/空白为类型段。无 ':'
+   ⇒ 整条为名、类型为空（Theory 节的整句）。公理条目整体包在一个 hov 2 箱里
+   （节变量条目无箱），单元素箱先解包再切。 *)
+let parse_entry (ds : Pp.doc_view list) : assumption_entry =
+  let ds =
+    match ds with
+    | [ Pp.Ppcmd_box (_, content) ] -> flatten_pp (Pp.repr content)
+    | _ -> ds
+  in
+  let rec go acc = function
+    | [] -> { kernel_name = String.trim (render_pp (List.rev acc)); printed_type = "" }
+    | Pp.Ppcmd_string text :: rest ->
+        (match String.index_opt text ':' with
+         | None -> go (Pp.Ppcmd_string text :: acc) rest
+         | Some i ->
+             let name = String.trim (render_pp (List.rev acc) ^ String.sub text 0 i) in
+             let after = String.trim (String.sub text (i + 1) (String.length text - i - 1)) in
+             let rest =
+               (if after = "" then [] else [ Pp.Ppcmd_string after ]) @ rest
+             in
+             let rest =
+               match rest with Pp.Ppcmd_print_break _ :: tail -> tail | _ -> rest
+             in
+             { kernel_name = name; printed_type = String.trim (render_pp rest) })
+    | d :: rest -> go (d :: acc) rest
+  in
+  go [] ds
+
+type assumptions_parse = [ `Closed | `Items of assumption_entry list | `Unrecognized ]
+
+(* 顶层状态机：字符串累积为标题候选；fnl 把候选核为已知标题；其后的 vbox 0 为
+   该节的条目箱（按 fnl 切条）。未知标题 / 标题前出现条目箱 / 其它顶层命令 ⇒
+   `Unrecognized。 *)
+let parse_assumptions (msg : Pp.t) : assumptions_parse =
+  match flatten_pp (Pp.repr msg) with
+  | [ Pp.Ppcmd_string text ] when String.trim text = closed_line -> `Closed
+  | [] -> `Unrecognized
+  | top ->
+      let title = Buffer.create 16 in
+      let title_known = ref false in
+      let entries = ref [] in
+      let unrecognized = ref false in
+      let split_entries content =
+        let rec split acc current = function
+          | [] -> List.rev (if current = [] then acc else List.rev current :: acc)
+          | Pp.Ppcmd_force_newline :: rest -> split (List.rev current :: acc) [] rest
+          | x :: rest -> split acc (x :: current) rest
+        in
+        split [] [] (flatten_pp (Pp.repr content))
+      in
+      List.iter
+        (fun d ->
+           match d with
+           | Pp.Ppcmd_string text -> Buffer.add_string title text
+           | Pp.Ppcmd_empty | Pp.Ppcmd_comment _ -> ()
+           | Pp.Ppcmd_force_newline ->
+               let candidate = String.trim (Buffer.contents title) in
+               Buffer.clear title;
+               if not (List.mem candidate assumption_titles) then unrecognized := true
+               else title_known := true
+           | Pp.Ppcmd_box (Pp.Pp_vbox 0, content) ->
+               if not !title_known then unrecognized := true;
+               title_known := false;
+               List.iter (fun chunk -> entries := parse_entry chunk :: !entries) (split_entries content)
+           | _ -> unrecognized := true)
+        top;
+      if !unrecognized then `Unrecognized else `Items (List.rev !entries)
+
+(* 反馈里取第一条能按 Print Assumptions 结构解析的消息（警告等其它消息跳过）；
+   都解析不出 ⇒ `Unrecognized。 *)
+let parse_assumptions_of (messages : Pp.t list) : assumptions_parse =
+  let rec go = function
+    | [] -> `Unrecognized
+    | msg :: rest ->
+        (match parse_assumptions msg with
+         | `Unrecognized -> go rest
+         | parsed -> parsed)
+  in
+  go messages
+
+let assumption_root ~parts ~(requested : T.Text.t) ~text ~messages ~failure =
   let reason = Stdlib.Option.value failure ~default:"no output" in
   let raw_text = if text <> "" then text else reason in
   let raw = child_of parts raw_text in
@@ -335,24 +427,18 @@ let assumption_root ~parts ~(requested : T.Text.t) ~text ~failure =
     match failure with
     | Some _ -> (T.AsmUnavailable, [], T.FKnown reason)
     | None ->
-        (match split_lines text with
-         | first :: _ when String.starts_with first ~prefix:closed_line ->
-             (T.AsmClosed, [], T.FNotApplicable)
-         | [] -> (T.AsmUnavailable, [], T.FKnown reason)
-         | lines ->
+        (match parse_assumptions_of messages with
+         | `Closed -> (T.AsmClosed, [], T.FNotApplicable)
+         | `Unrecognized ->
+             (* 结构不符：不伪造条目，按不可用处理（raw 仍可核）。 *)
+             (T.AsmUnavailable, [], T.FKnown "unrecognized Print Assumptions output")
+         | `Items entries ->
              let items =
-               List.filter_map
-                 (fun line ->
-                    if header_line line then None
-                    else
-                      match kernel_name_of line with
-                      | None -> None
-                      | Some kernel_name ->
-                          Some
-                            (T.make_assumption_item
-                               ~kernel_name:(text_value kernel_name)
-                               ~printed_type:(child_of parts line).view))
-                 lines
+               List.map
+                 (fun entry ->
+                    T.make_assumption_item ~kernel_name:(text_value entry.kernel_name)
+                      ~printed_type:(child_of parts entry.printed_type).view)
+                 entries
              in
              (T.AsmAssumptions, items, T.FNotApplicable))
   in
@@ -419,7 +505,7 @@ let build ~token ~(anchor : Query.anchor) ~binding ~cap ~selector =
           (fun (requested : T.Text.t) ->
              match assumptions_ast ~token ~st:anchor.Query.state requested with
              | None ->
-                 assumption_root ~parts ~requested ~text:""
+                 assumption_root ~parts ~requested ~text:"" ~messages:[]
                    ~failure:(Some "unparseable or non-qualid constant reference")
              | Some ast ->
                  let exec = Query.execute_asts ~token ~anchor ~cap [ ast ] in
@@ -432,7 +518,8 @@ let build ~token ~(anchor : Query.anchor) ~binding ~cap ~selector =
                    | `Ok when not exec.Query.restored -> Some "state restore failed"
                    | `Ok -> None
                  in
-                 assumption_root ~parts ~requested ~text:exec.Query.captured ~failure)
+                 assumption_root ~parts ~requested ~text:exec.Query.captured
+                   ~messages:exec.Query.messages ~failure)
           names
       in
       `Payload (get (T.make_assumptions_facts roots), parts)

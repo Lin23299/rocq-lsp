@@ -200,6 +200,7 @@ type execution = {
   outcome : [ `Ok | `Error | `Interrupted ];
   error : string option;                           (* Coq 用户错误/异常文本 *)
   restored : bool;                                 (* 原状态恢复成功 *)
+  messages : Coq.Pp_t.t list;                      (* 反馈消息的原始 Pp（未渲染、未截断） *)
 }
 
 let error_text = function
@@ -236,9 +237,13 @@ let execute_asts ~token ~(anchor : anchor) ~cap asts =
       end
     end
   in
+  (* 原始 Pp 按反馈顺序留存：Print Assumptions 的结构化解析按 Pp 结构切分，不按
+     渲染后的折行文本（审核 10）。 *)
+  let messages = ref [] in
   let capture_feedback feedback =
     List.iter
       (fun (_, (payload : _ Coq.Message.Payload.t)) ->
+         messages := payload.Coq.Message.Payload.msg :: !messages;
          capture_text (Coq.Pp_t.to_string payload.Coq.Message.Payload.msg ^ "\n"))
       feedback
   in
@@ -282,7 +287,8 @@ let execute_asts ~token ~(anchor : anchor) ~cap asts =
             error := error_text e
         | Coq.Protect.R.Interrupted -> outcome := `Interrupted));
   { captured = Buffer.contents buffer; truncated = !truncated;
-    outcome = !outcome; error = !error; restored = !restored }
+    outcome = !outcome; error = !error; restored = !restored;
+    messages = List.rev !messages }
 
 (* —— 发布（view 锁 → Registry 锁）—— *)
 

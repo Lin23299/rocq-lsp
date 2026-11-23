@@ -13,8 +13,9 @@
       Prepared（并产出本批派生的 import map 与 mapping artifact_ref），
       take_for_activation 供 activate 核对后置 Activated。
     不承诺的事：不解释 wire、不做预算/配对矩阵/期限裁决；不伪造材料——
-    digest 不符即弃并释放输入配额；上传材料封存后本批无 release 通道，
-    输入配额保持占用（真实材料仍在内存，与 source 封存同口径）；下载材料
+    digest 不符即弃并释放输入配额；上传材料封存后本批无独立 release 通道，
+    输入配额保持占用（真实材料仍在内存，与 source 封存同口径），只在所属
+    scope Closed 时经 discard_operation 按属主操作回收并释放配额；下载材料
     的 release 是真实清理（释放字节、置 released，后续 pull 报 Retired）；
     本批导入映射行留空（真实 map 由后续 owner 输入，见 prepare 注释）。
     锁序约定：本模块锁 → Registry 锁（输入配额记账），禁止反序。 *)
@@ -58,8 +59,13 @@ type import_entry = {
   mutable import_binding : T.op_binding option;   (* 触发 prepare 的导入操作 *)
 }
 
-(* 上传封存材料：字节 + 完整 artifact_ref（begin 幂等核对身份用）。 *)
-type sealed_material = { bytes : string; artifact : T.artifact_ref }
+(* 上传封存材料：字节 + 完整 artifact_ref（begin 幂等核对身份用）+ 上传它的操作
+   id（scope Closed 时按操作回收材料与输入配额）。 *)
+type sealed_material = {
+  bytes : string;
+  artifact : T.artifact_ref;
+  operation : T.Id.t;
+}
 
 let lock = Mutex.create ()
 
@@ -179,11 +185,66 @@ let finish_upload transfer_id operation :
             end
             else begin
               Hashtbl.replace materials (T.Id.get transfer_id)
-                { bytes = raw; artifact = up.transfer.ct_artifact };
+                { bytes = raw; artifact = up.transfer.ct_artifact;
+                  operation = up.transfer.ct_operation };
               Hashtbl.remove uploads (T.Id.get transfer_id);
               `Registered up.transfer.ct_artifact
             end
           end)
+
+(* 按属主操作真实回收全部材料（item 5 EndScope Closed 用；本模块锁内，输入配额
+   经 Registry 锁——锁序 本模块锁 → Registry 锁，调用方不得持 Registry 锁）：
+   该操作的在途上传暂存、封存材料、下载 spool 记录、import arena 条目一并删除，
+   并释放上传时占用的输入配额（封存后配额一直保持占用，这里是唯一释放路径；
+   审核 12：reclaim=Known 发布时材料仍在内存）。返回删除的材料条数。 *)
+let discard_operation ~operation =
+  let op_key = T.Id.get operation in
+  let dropped = ref 0 in
+  let upload_keys =
+    Hashtbl.fold
+      (fun key (up : upload_state) acc ->
+         if T.Id.get up.transfer.ct_operation = op_key then key :: acc else acc)
+      uploads []
+  in
+  List.iter
+    (fun key ->
+       (match Hashtbl.find_opt uploads key with
+        | Some up -> release_input up.expected_bytes
+        | None -> ());
+       Hashtbl.remove uploads key)
+    upload_keys;
+  let material_keys =
+    Hashtbl.fold
+      (fun key (sealed : sealed_material) acc ->
+         if T.Id.get sealed.operation = op_key then key :: acc else acc)
+      materials []
+  in
+  List.iter
+    (fun key ->
+       (match Hashtbl.find_opt materials key with
+        | Some sealed ->
+            release_input (T.U.get sealed.artifact.artifact_bytes);
+            incr dropped
+        | None -> ());
+       Hashtbl.remove materials key)
+    material_keys;
+  let download_keys =
+    Hashtbl.fold
+      (fun key (d : download_state) acc ->
+         if T.Id.get d.operation = op_key then key :: acc else acc)
+      downloads []
+  in
+  List.iter (Hashtbl.remove downloads) download_keys;
+  let import_keys =
+    Hashtbl.fold
+      (fun key (entry : import_entry) acc ->
+         match entry.import_binding with
+         | Some binding when T.Id.get (T.op_binding_operation binding) = op_key -> key :: acc
+         | _ -> acc)
+      imports []
+  in
+  List.iter (Hashtbl.remove imports) import_keys;
+  !dropped
 
 (* —— 下载迁移（pull/ack/release 簿记；配对矩阵/预算归 dispatch）—— *)
 
@@ -352,14 +413,17 @@ let prepare_validated ~cache ~binding ~group ~instance ~backend_epoch ~manager_e
     match T.encode_checkpoint_import_map S.message_limits map with
     | Error _ -> Error (`Validate "import_map 编码失败")
     | Ok map_bytes ->
+        (* mapping 的 digest/bytes 取实际派生的 map 字节（它就是下载 spool 服务的
+           材料）。Rust checkpoint.rs:246-256 以 artifact.digest/bytes 核每一块与
+           末块 SHA-256：取 manifest 同值而服务 map 字节 ⇒ 末块摘要必不符 ⇒ 隔离。 *)
         let mapping : T.artifact_ref =
           {
             artifact_id =
               id_value
                 (Format.asprintf "map-%s-%s" (T.Id.get cache)
                    (T.Id.get (T.op_binding_operation binding)));
-            artifact_digest = manifest.artifact_digest;
-            artifact_bytes = manifest.artifact_bytes;
+            artifact_digest = get (T.Digest.make (S.sha256 map_bytes));
+            artifact_bytes = uint (Int64.of_int (String.length map_bytes));
             artifact_kind = T.CkMap;
           }
         in
@@ -373,8 +437,8 @@ let prepare_validated ~cache ~binding ~group ~instance ~backend_epoch ~manager_e
    ⇒ phase=Prepared、group/import_binding 记账，返回（派生 import map 字节,
    mapping artifact_ref）。
    本批口径：导入映射行留空（validated_node_count=0 合法）；mapping 的
-   digest/bytes 取 manifest 同值、id=map-<cache>-<operation>——由 manifest
-   派生，真实 map 由后续 owner 输入（devlog「实际 NC01 完整制品事实…」）。 *)
+   digest/bytes 取实际派生的 map 字节、id=map-<cache>-<operation>——真实 map
+   由后续 owner 输入（devlog「实际 NC01 完整制品事实…」）。 *)
 let prepare_import ~cache ~binding ~group ~instance ~backend_epoch ~manager_epoch
     ~plan ~manifest ~bundle ~compatibility ~manifest_cap :
     [ `Prepared of string * T.artifact_ref | `Conflict | prepare_failure ] =

@@ -27,8 +27,8 @@
       aux 重放原事实。准入：admit（序号/退役/预算登记/entry_uses_budget/
       budget_for_checkpoint_entry）+ checkpoint_budget_binding 与 args 的
       control/attempt 核对。
-    不承诺的事：本批导入映射 digest/bytes 取 manifest 同值、行留空——真实
-    map 由后续 owner 输入；观察/导出不产出真实制品；环境占用/隔离
+    不承诺的事：本批导入映射行留空（digest/bytes 取实际派生的 map 字节）——
+    真实 map 由后续 owner 输入；观察/导出不产出真实制品；环境占用/隔离
     （require_new_work/quarantine）是驱动侧状态，Pet 侧无从核对，不伪造。 *)
 
 module T = Ccv_protocol.Types

@@ -62,6 +62,18 @@ let unreleased_views ~operation =
          spools;
        !count)
 
+(* 该 context 的同步记账版本（NN01 locate 的 expected_context.rev 核的是它：变化同步
+    后 context 版本 +1 而主线线版本不变；无记账 ⇒ None，调用方按首次播种口径以
+    主线线版本核对）。本模块锁内；调用方不得持 Registry 锁（锁序 Sync→Registry）。 *)
+let context_revision ~context =
+  Mutex.lock lock;
+  Fun.protect
+    ~finally:(fun () -> Mutex.unlock lock)
+    (fun () ->
+       match Hashtbl.find_opt contexts (T.Id.get context) with
+       | Some state -> Some state.revision
+       | None -> None)
+
 let uri_counter = ref 0
 
 let init ~boot =

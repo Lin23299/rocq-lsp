@@ -8,8 +8,9 @@
     make_ended_closing（首次 seq=1，reclaim=Unknown）并封新准入（Closing 后该 scope
     拒新执行）；借用清空 ⇒ make_ended_closed（seq=上一回执 seq+1，reclaim=Known 新
     id），并从 Registry 真实删除该 scope 名下操作（保留本 end-scope 操作的 Closed
-    终态与历史回执）、丢弃其私有视图材料、删除无操作引用的线；共享 context 的 doc
-    持有操作若仍被其它 scope 的操作引用则保留。
+    终态与历史回执）、丢弃其私有视图材料、回收其 checkpoint 材料并释放输入
+    配额、删除无操作引用的线；共享 context 的 doc 持有操作若仍被其它 scope 的
+    操作引用则保留。
     不承诺的事：staged 协议库 T.entry_uses_budget 不含 EndScope 分支，Pet 只核可访问
     的 binding↔budget 关系与原请求 digest，initial_request digest 核对留待协议库补齐
     后切回 entry_uses_budget；reclaim 观测（roots 数组）与外部登记 / 原退役决定由
@@ -176,6 +177,15 @@ let release_registry ~(keep : Registry.operation) ops =
 let release_views operations =
   Query_view.with_lock (fun () ->
       List.iter (fun operation -> ignore (Query_view.discard_operation ~operation)) operations)
+
+(* checkpoint 材料（审核 12）：该 scope 名下操作的在途上传暂存、封存材料、下载
+   spool 记录、import arena 条目一并回收，并释放上传占用的输入配额——此前 Closed
+   后材料仍在内存、Registry.input_reserved 无清理路径。Arena 锁 → Registry 锁，
+   在 Registry 锁外调用（与 release_views 同位）。 *)
+let release_materials operations =
+  Arena.with_lock (fun () ->
+      List.iter (fun operation -> ignore (Arena.discard_operation ~operation)) operations)
+
 let release_lines () =
   let line_keys =
     let keys = ref [] in
@@ -278,6 +288,7 @@ let run ~request ~header ~binding ~scope ~expected_revision =
         (* 借用清空：按真实结果发布 Closed，真实删除该 scope 的容器。 *)
         let doomed = Registry.with_tables (fun () -> release_registry ~keep:op ops) in
         release_views doomed;
+        release_materials doomed;
         Registry.with_tables release_lines;
         Registry.with_tables (fun () ->
             let reclaim =

@@ -97,7 +97,16 @@ and check_order (o : C.fixpoint_order_expr) =
 
 and check_term (c : C.constr_expr) =
   match c.CAst.v with
-  | C.CRef _ -> Ok ()
+  | C.CRef (_, instance) ->
+      (* Rocq 9.0 的 constr_expr 里 CRef 只带已解析的 qualid 与 universe 实例
+         （quality_expr/univ_level_expr 列表，无引用）：by-notation 引用只出现在
+         vernac 层的 qualid-or-by-notation（PrintName / PrintAssumptions / PrintAbout /
+         PrintInstances / PrintHint / PrintImplicit / PrintStrategy / LocateAny /
+         LocateTerm / RefClass），全部经 plain_qualid 拒绝 ByNotation。term 位置的
+         `"+"%nat` 解析为 CDelim(nat, CPrim(String))——字符串字面量而非 notation
+         引用（实测 classify 放行、执行报 Coq 用户错误）。 *)
+      ignore instance;
+      Ok ()
   | C.CFix (_, rows) ->
       sequence
         (List.map
